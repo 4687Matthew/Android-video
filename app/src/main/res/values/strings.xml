@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">视频编辑器</string>
+    <string name="select_video">选择视频</string>
+    <string name="crop_video">裁剪视频</string>
+    <string name="split_video">分割视频</string>
+    <string name="merge_videos">合并视频</string>
+    <string name="speed_up">快放</string>
+    <string name="speed_down">慢放</string>
+    <string name="processing">处理中...</string>
+    <string name="success">处理成功</string>
+    <string name="error">处理失败</string>
+    <string name="start_time">开始时间(秒)</string>
+    <string name="end_time">结束时间(秒)</string>
+    <string name="split_time">分割时间(秒)</string>
+    <string name="speed_factor">速度倍数</string>
+    <string name="process">处理</string>
+    <string name="select_second_video">选择第二个视频</string>
+    <string name="video_info">获取视频信息</string>
+</resources>
+
