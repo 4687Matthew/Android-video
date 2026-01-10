@@ -32,13 +32,6 @@
             android:layout_marginTop="8dp"
             android:text="@string/video_info" />
 
-        <Button
-            android:id="@+id/btnCompress"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="降低码率" />
-
         <TextView
             android:id="@+id/VideoInfo"
             android:layout_width="match_parent"
@@ -46,6 +39,20 @@
             android:layout_marginBottom="16dp"
             android:text=""
             android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnCompressBase"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="降低码率串行" />
+
+        <Button
+            android:id="@+id/btnCompress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="降低码率并行" />
 
         <!-- 裁剪视频 -->
         <TextView

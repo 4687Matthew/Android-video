@@ -40,6 +40,7 @@ public class MainActivity extends AppCompatActivity {
     private Button btnSelectVideo;
     private Button btnGetInfo;
     private Button btnCompress;
+    private Button btnCompressBase;
     private Button btnSelectSecondVideo;
     private Button btnCrop;
     private Button btnSplit;
@@ -75,6 +76,7 @@ public class MainActivity extends AppCompatActivity {
         btnSelectVideo = findViewById(R.id.btnSelectVideo);
         btnGetInfo = findViewById(R.id.btnGetInfo);
         btnCompress = findViewById(R.id.btnCompress);
+        btnCompressBase = findViewById(R.id.btnCompressBase);
         btnSelectSecondVideo = findViewById(R.id.btnSelectSecondVideo);
         btnCrop = findViewById(R.id.btnCrop);
         btnSplit = findViewById(R.id.btnSplit);
@@ -123,12 +125,66 @@ public class MainActivity extends AppCompatActivity {
         btnSelectSecondVideo.setOnClickListener(v -> selectVideo(REQUEST_CODE_SELECT_SECOND_VIDEO));
         btnGetInfo.setOnClickListener(v -> getVideoInfo());
         btnCompress.setOnClickListener(v -> compressHevc());
+        btnCompressBase.setOnClickListener(v -> compressHevcBase());
 
         btnCrop.setOnClickListener(v -> cropVideo());
         btnSplit.setOnClickListener(v -> splitVideo());
         btnMerge.setOnClickListener(v -> mergeVideos());
         btnSpeedUp.setOnClickListener(v -> adjustSpeed(true));
         btnSpeedDown.setOnClickListener(v -> adjustSpeed(false));
+    }
+
+    private void compressHevcBase() {
+        if (selectedVideoPath == null) { showToast("请先选择视频"); return; }
+
+        // 检查文件是否存在
+        File inputFile = new File(selectedVideoPath);
+        if (!inputFile.exists()) {
+            showToast("输入文件不存在");
+            return;
+        }
+
+        String fileName = "hevc_" + System.currentTimeMillis() + ".mp4";
+        String outPath;
+        try {
+            outPath = createPublicVideoFile(fileName);
+
+            // 检查输出目录是否可写
+            File outFile = new File(outPath);
+            File parentDir = outFile.getParentFile();
+            if (!parentDir.exists()) {
+                parentDir.mkdirs();
+            }
+        } catch (IOException e) {
+            showToast("创建输出文件失败: " + e.getMessage());
+            return;
+        }
+
+        showProgress(true);
+        tvStatus.setText("正在压缩视频...");
+
+        new Thread(() -> {
+            boolean ok = VideoEditor.compressToHevc(selectedVideoPath, outPath, 0.45);
+            runOnUiThread(() -> {
+                showProgress(false);
+                if (ok) {
+                    // 检查输出文件是否存在且有内容
+                    File outputFile = new File(outPath);
+                    if (outputFile.exists() && outputFile.length() > 0) {
+                        scanMediaFile(outPath);
+                        tvStatus.setText("压缩完成，文件大小: " +
+                                (outputFile.length() / 1024 / 1024) + "MB");
+                        showToast("压缩完成");
+                    } else {
+                        tvStatus.setText("压缩失败：输出文件为空");
+                        showToast("压缩失败：输出文件为空");
+                    }
+                } else {
+                    tvStatus.setText("压缩失败");
+                    showToast("压缩失败");
+                }
+            });
+        }).start();
     }
 
     private void compressHevc() {
@@ -161,7 +217,8 @@ public class MainActivity extends AppCompatActivity {
         tvStatus.setText("正在压缩视频...");
 
         new Thread(() -> {
-            boolean ok = VideoEditor.compressToHevc(selectedVideoPath, outPath, 0.45);
+            boolean ok = VideoEditor.compressVideo(selectedVideoPath, outPath, 0.45);
+//            boolean ok = VideoEditor.compressToHevc(selectedVideoPath, outPath, 0.45);
             runOnUiThread(() -> {
                 showProgress(false);
                 if (ok) {

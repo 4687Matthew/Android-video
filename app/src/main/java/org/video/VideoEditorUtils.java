@@ -1,18 +1,13 @@
 package org.video;
 
 import android.content.ContentUris;
-import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
-import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
-
-import java.io.File;
-import java.io.IOException;
 
 public class VideoEditorUtils {
     /**
