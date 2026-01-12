@@ -972,12 +972,21 @@ public class VideoEditor {
             // 3. 动态计算线程数和分片大小
             // 原则：每个分片至少15秒，最多4个线程
             long minSegmentDuration = 15 * 1000000L; // 15秒
-            int maxThreads = Math.min(4, Runtime.getRuntime().availableProcessors() - 1);
-            maxThreads = Math.max(2, maxThreads); // 至少2个线程
+            int availableCores = Runtime.getRuntime().availableProcessors();
+            Log.d(TAG, "可用处理器核心数: " + availableCores);
 
+
+            int maxThreads;
+            if (duration > 5 * 60 * 1000000L) { // 超过5分钟
+                maxThreads = Math.max(2, availableCores / 2);
+            } else {
+                maxThreads = Math.min(4, availableCores - 1);
+            }
+
+            long maxSegmentDuration = 3 * 60 * 1000000L; // 每个分片最多3分钟
             int optimalThreads = (int) Math.min(
                     maxThreads,
-                    Math.max(2, duration / minSegmentDuration)
+                    Math.max(2, (duration + maxSegmentDuration - 1) / maxSegmentDuration)
             );
 
             Log.d(TAG, "使用 " + optimalThreads + " 个线程进行并行转码");
@@ -989,28 +998,60 @@ public class VideoEditor {
             List<Long> segmentStarts = new ArrayList<>();
             List<Long> segmentEnds = new ArrayList<>();
 
-            for (int i = 0; i < optimalThreads; i++) {
-                long startTime = i * segmentDuration;
-                long endTime = (i == optimalThreads - 1) ? duration : (i + 1) * segmentDuration;
+// 首先，收集所有关键帧位置
+            List<Long> keyFramePositions = new ArrayList<>();
+            extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+            long currentPosition = 0;
 
-                // 对每个分片（包括第一个）都寻找关键帧
-                if (i > 0 || startTime > 0) { // 第一个分片如果从0开始，可能已经是关键帧
+            while (currentPosition < duration) {
+                keyFramePositions.add(currentPosition);
+                // 寻找下一个关键帧
+                extractor.seekTo(currentPosition, MediaExtractor.SEEK_TO_NEXT_SYNC);
+                long nextPosition = extractor.getSampleTime();
+                if (nextPosition <= currentPosition || nextPosition >= duration) {
+                    break;
+                }
+                currentPosition = nextPosition;
+            }
+
+// 如果没有找到足够的关键帧，使用平均分片
+            if (keyFramePositions.size() < optimalThreads) {
+                Log.w(TAG, "关键帧数量不足，使用平均分片");
+                for (int i = 0; i < optimalThreads; i++) {
+                    long startTime = i * segmentDuration;
+                    long endTime = (i == optimalThreads - 1) ? duration : (i + 1) * segmentDuration;
+
+                    // 对齐到最近的关键帧
                     extractor.seekTo(startTime, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
                     startTime = extractor.getSampleTime();
                     if (startTime < 0) startTime = i * segmentDuration;
+
+                    // 确保不重叠
+                    if (i > 0 && startTime < segmentEnds.get(i-1)) {
+                        startTime = segmentEnds.get(i-1);
+                    }
+
+                    segmentStarts.add(startTime);
+                    segmentEnds.add(endTime);
                 }
+            } else {
+                // 使用关键帧作为分片边界
+                int framesPerSegment = keyFramePositions.size() / optimalThreads;
+                for (int i = 0; i < optimalThreads; i++) {
+                    int frameIndex = i * framesPerSegment;
+                    long startTime = keyFramePositions.get(frameIndex);
+                    long endTime = (i == optimalThreads - 1) ? duration :
+                            keyFramePositions.get(Math.min(frameIndex + framesPerSegment, keyFramePositions.size() - 1));
 
-                // 确保分片不重叠（除了第一个分片）
-                if (i > 0 && startTime < segmentEnds.get(i-1)) {
-                    startTime = segmentEnds.get(i-1);
+                    segmentStarts.add(startTime);
+                    segmentEnds.add(endTime);
                 }
+            }
 
-                segmentStarts.add(startTime);
-                segmentEnds.add(endTime);
-
+            for (int i = 0; i < optimalThreads; i++) {
                 Log.d(TAG, String.format("分片%d: %.3fs - %.3fs (时长: %.3fs)",
-                        i, startTime/1000000.0, endTime/1000000.0,
-                        (endTime - startTime)/1000000.0));
+                        i, segmentStarts.get(i)/1000000.0, segmentEnds.get(i)/1000000.0,
+                        (segmentEnds.get(i) - segmentStarts.get(i))/1000000.0));
             }
 
             // 5. 并行转码每个分片
@@ -1024,38 +1065,58 @@ public class VideoEditor {
                 final long endTime = segmentEnds.get(i);
 
                 futures.add(executor.submit(() -> {
-                    try {
-                        // 使用缓存目录
-                        File tempFile = File.createTempFile(
-                                "video_segment_" + segmentIndex + "_",
-                                ".mp4",
-                                getCacheDir()
-                        );
+                    // 重试机制：最多尝试3次
+                    for (int retry = 0; retry < 3; retry++) {
+                        try {
+                            File tempFile = File.createTempFile(
+                                    "video_segment_" + segmentIndex + "_",
+                                    ".mp4",
+                                    getCacheDir()
+                            );
 
-                        Log.d(TAG, String.format("开始处理分片%d [%.3fs-%.3fs]",
-                                segmentIndex, startTime/1000000.0, endTime/1000000.0));
+                            if (retry > 0) {
+                                Log.w(TAG, String.format("分片%d第%d次重试", segmentIndex, retry + 1));
+                                // 删除可能存在的旧文件
+                                if (tempFile.exists()) {
+                                    tempFile.delete();
+                                }
+                            }
 
-                        boolean success = transcodeSegment(
-                                src, tempFile.getAbsolutePath(),
-                                startTime, endTime,
-                                finalTargetBitrate,
-                                finalVideoFormat,
-                                segmentIndex
-                        );
+                            boolean success = transcodeSegment(
+                                    src, tempFile.getAbsolutePath(),
+                                    startTime, endTime,
+                                    finalTargetBitrate,
+                                    finalVideoFormat,
+                                    segmentIndex
+                            );
 
-                        if (success && tempFile.exists() && tempFile.length() > 1024) {
-                            Log.d(TAG, String.format("分片%d处理成功, 大小: %.1fKB",
-                                    segmentIndex, tempFile.length() / 1024.0));
-                            return tempFile;
-                        } else {
-                            Log.e(TAG, "分片" + segmentIndex + "处理失败或文件太小");
-                            if (tempFile.exists()) tempFile.delete();
-                            return null;
+                            // 验证生成的视频文件
+                            if (success && tempFile.exists() && tempFile.length() > 100 * 1024) { // 至少100KB
+                                Log.d(TAG, String.format("分片%d处理成功, 大小: %.1fMB",
+                                        segmentIndex, tempFile.length() / (1024.0 * 1024.0)));
+                                return tempFile;
+                            } else {
+                                Log.e(TAG, String.format("分片%d处理失败: success=%s, exists=%s, size=%d",
+                                        segmentIndex, success, tempFile.exists(), tempFile.length()));
+                                if (tempFile.exists()) {
+                                    tempFile.delete();
+                                }
+
+                                if (retry == 2) {
+                                    return null;
+                                }
+                                // 等待后重试
+                                Thread.sleep(1000 * (retry + 1));
+                            }
+                        } catch (Exception e) {
+                            Log.e(TAG, "分片" + segmentIndex + "异常: " + e.getMessage(), e);
+                            if (retry == 2) {
+                                return null;
+                            }
+                            Thread.sleep(1000 * (retry + 1));
                         }
-                    } catch (Exception e) {
-                        Log.e(TAG, "分片" + segmentIndex + "异常: " + e.getMessage(), e);
-                        return null;
                     }
+                    return null;
                 }));
             }
 
@@ -1324,7 +1385,7 @@ public class VideoEditor {
     }
 
     /**
-     * 转码单个视频分片 - 最终修复版（确保时间戳连续性）
+     * 转码单个视频分片 - 简化稳定版（去除复杂的时间戳处理）
      */
     private static boolean transcodeSegment(String src, String dst,
                                             long startTime, long endTime,
@@ -1335,105 +1396,105 @@ public class VideoEditor {
         MediaMuxer muxer = null;
         MediaCodec decoder = null, encoder = null;
 
-        // 关键修复：使用队列管理输入时间戳，确保编码器输出时使用正确的时间戳
-        Queue<Long> inputTimestampQueue = new LinkedList<>();
-        long firstInputPts = -1;
-        long lastInputPts = -1;
-        long firstOutputPts = -1;
-        long lastOutputPts = -1;
-
         try {
+            Log.d(TAG, String.format("分片%d: 开始处理 [%.3fs-%.3fs]",
+                    segmentIndex, startTime/1000000.0, endTime/1000000.0));
+
+            // 1. 创建Extractor
             extractor = new MediaExtractor();
             extractor.setDataSource(src);
 
-            // 选择视频轨道
-            int trackIndex = -1;
-            MediaFormat videoFormat = null;
+            // 找到视频轨道
+            int videoTrackIndex = -1;
+            MediaFormat inputFormat = null;
             for (int i = 0; i < extractor.getTrackCount(); i++) {
                 MediaFormat format = extractor.getTrackFormat(i);
                 if (format.getString(MediaFormat.KEY_MIME).startsWith("video/")) {
-                    trackIndex = i;
-                    videoFormat = format;
+                    videoTrackIndex = i;
+                    inputFormat = format;
                     break;
                 }
             }
 
-            if (trackIndex == -1) {
+            if (videoTrackIndex == -1) {
                 Log.e(TAG, "分片" + segmentIndex + ": 未找到视频轨道");
                 return false;
             }
 
-            extractor.selectTrack(trackIndex);
+            extractor.selectTrack(videoTrackIndex);
 
-            // 定位到分片开始时间（已对齐到关键帧）
-            if (startTime > 0) {
-                extractor.seekTo(startTime, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
-            }
+            // 2. 定位到起始位置（使用SEEK_TO_CLOSEST_SYNC）
+            extractor.seekTo(startTime, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+            long actualStartTime = extractor.getSampleTime();
+            if (actualStartTime < 0) actualStartTime = startTime;
 
+            Log.d(TAG, String.format("分片%d: 实际起始时间 %.3fs",
+                    segmentIndex, actualStartTime/1000000.0));
+
+            // 3. 获取视频参数
             int width = originalFormat.getInteger(MediaFormat.KEY_WIDTH);
             int height = originalFormat.getInteger(MediaFormat.KEY_HEIGHT);
             int frameRate = originalFormat.containsKey(MediaFormat.KEY_FRAME_RATE)
                     ? originalFormat.getInteger(MediaFormat.KEY_FRAME_RATE) : 30;
 
-            // 编码器配置
+            // 4. 配置编码器（使用AVC，兼容性更好）
             MediaFormat encoderFormat = MediaFormat.createVideoFormat(
-                    MediaFormat.MIMETYPE_VIDEO_HEVC, width, height);
+                    MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
             encoderFormat.setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate);
             encoderFormat.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate);
             encoderFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
             encoderFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
-            encoderFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, width * height * 3 / 2);
 
-            // 尝试HEVC，失败则使用AVC
+            // 尝试AVC编码器
             try {
-                encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC);
-                encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                encoder.start();
+                encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
             } catch (Exception e) {
-                encoderFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
+                Log.e(TAG, "AVC编码器创建失败，尝试HEVC", e);
+                encoderFormat = MediaFormat.createVideoFormat(
+                        MediaFormat.MIMETYPE_VIDEO_HEVC, width, height);
                 encoderFormat.setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate);
                 encoderFormat.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate);
                 encoderFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
                 encoderFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                         MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
-                encoderFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, width * height * 3 / 2);
-
-                encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-                encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                encoder.start();
+                encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC);
             }
 
-            // 创建解码器
-            String mimeType = videoFormat.getString(MediaFormat.KEY_MIME);
+            encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            encoder.start();
+
+            // 5. 创建解码器
+            String mimeType = inputFormat.getString(MediaFormat.KEY_MIME);
             decoder = MediaCodec.createDecoderByType(mimeType);
-            decoder.configure(videoFormat, null, null, 0);
+            decoder.configure(inputFormat, null, null, 0);
             decoder.start();
 
-            // 创建复用器
+            // 6. 创建Muxer
             muxer = new MediaMuxer(dst, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
 
+            // 7. 转码循环
             MediaCodec.BufferInfo decInfo = new MediaCodec.BufferInfo();
             MediaCodec.BufferInfo encInfo = new MediaCodec.BufferInfo();
 
             boolean inputEos = false;
             boolean outputEos = false;
-            boolean decoderOutputEos = false;
-            int outVideoTrack = -1;
+            boolean muxerStarted = false;
+            int muxerVideoTrack = -1;
             int frameCount = 0;
-            long startProcessingTime = System.currentTimeMillis();
+            long presentationTime = 0;
+            long timeStep = 1000000L / frameRate; // 基于帧率的时间间隔
 
-            // 主循环
             while (!outputEos) {
-                // 1. 向解码器输入数据
+                // 向解码器输入数据
                 if (!inputEos) {
-                    int inIndex = decoder.dequeueInputBuffer(10000);
-                    if (inIndex >= 0) {
-                        ByteBuffer buffer = decoder.getInputBuffer(inIndex);
+                    int inputIdx = decoder.dequeueInputBuffer(10000);
+                    if (inputIdx >= 0) {
+                        ByteBuffer buffer = decoder.getInputBuffer(inputIdx);
                         int sampleSize = extractor.readSampleData(buffer, 0);
 
                         if (sampleSize < 0) {
-                            decoder.queueInputBuffer(inIndex, 0, 0, 0,
+                            decoder.queueInputBuffer(inputIdx, 0, 0, 0,
                                     MediaCodec.BUFFER_FLAG_END_OF_STREAM);
                             inputEos = true;
                         } else {
@@ -1441,157 +1502,101 @@ public class VideoEditor {
 
                             // 检查是否超过分片结束时间
                             if (pts >= endTime) {
-                                decoder.queueInputBuffer(inIndex, 0, 0, 0,
+                                decoder.queueInputBuffer(inputIdx, 0, 0, 0,
                                         MediaCodec.BUFFER_FLAG_END_OF_STREAM);
                                 inputEos = true;
                             } else {
-                                decoder.queueInputBuffer(inIndex, 0, sampleSize, pts, 0);
+                                decoder.queueInputBuffer(inputIdx, 0, sampleSize, pts, 0);
                                 extractor.advance();
                             }
                         }
                     }
                 }
 
-                // 2. 从解码器获取输出
-                if (!decoderOutputEos) {
-                    int decIndex = decoder.dequeueOutputBuffer(decInfo, 10000);
-                    if (decIndex >= 0) {
-                        if ((decInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            decoderOutputEos = true;
-                            // 通知编码器输入结束
-                            int encInIndex = encoder.dequeueInputBuffer(10000);
-                            if (encInIndex >= 0) {
-                                encoder.queueInputBuffer(encInIndex, 0, 0, 0,
-                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM);
-                            }
-                        } else if (decInfo.size > 0) {
-                            long originalPts = decInfo.presentationTimeUs;
-                            Long relativePts = originalPts - startTime;
+                // 解码器输出
+                int decoderIdx = decoder.dequeueOutputBuffer(decInfo, 10000);
+                if (decoderIdx >= 0) {
+                    if ((decInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        // 通知编码器输入结束
+                        int encoderIdx = encoder.dequeueInputBuffer(10000);
+                        if (encoderIdx >= 0) {
+                            encoder.queueInputBuffer(encoderIdx, 0, 0, 0,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                        }
+                    } else if (decInfo.size > 0) {
+                        long originalPts = decInfo.presentationTimeUs;
 
-                            // 记录输入时间戳范围
-                            if (firstInputPts < 0) {
-                                firstInputPts = originalPts;
-                            }
-                            lastInputPts = originalPts;
+                        // 检查是否在分片时间范围内
+                        if (originalPts >= actualStartTime && originalPts < endTime) {
+                            // 编码器输入
+                            int encoderIdx = encoder.dequeueInputBuffer(10000);
+                            if (encoderIdx >= 0) {
+                                ByteBuffer encoderBuffer = encoder.getInputBuffer(encoderIdx);
+                                encoderBuffer.clear();
 
-                            // 检查是否在分片时间范围内
-                            if (originalPts >= startTime && originalPts < endTime) {
-                                int encInIndex = encoder.dequeueInputBuffer(10000);
-                                if (encInIndex >= 0) {
-                                    ByteBuffer encoderInput = encoder.getInputBuffer(encInIndex);
-                                    encoderInput.clear();
+                                ByteBuffer decodedFrame = decoder.getOutputBuffer(decoderIdx);
+                                if (decodedFrame != null) {
+                                    decodedFrame.position(decInfo.offset);
+                                    decodedFrame.limit(decInfo.offset + decInfo.size);
+                                    encoderBuffer.put(decodedFrame);
 
-                                    ByteBuffer decodedFrame = decoder.getOutputBuffer(decIndex);
-                                    if (decodedFrame != null) {
-                                        decodedFrame.limit(decInfo.offset + decInfo.size);
-                                        decodedFrame.position(decInfo.offset);
-                                        encoderInput.put(decodedFrame);
-
-                                        // 关键修复1：保存原始时间戳到队列
-                                        inputTimestampQueue.offer(originalPts);
-
-                                        // 关键修复2：编码器输入使用原始时间戳
-                                        encoder.queueInputBuffer(encInIndex, 0, decInfo.size, relativePts, 0);
-
-                                        frameCount++;
-                                    }
+                                    // 使用递增的时间戳，避免负数问题
+                                    encoder.queueInputBuffer(encoderIdx, 0,
+                                            decInfo.size, presentationTime, 0);
+                                    presentationTime += timeStep;
                                 }
                             }
                         }
-                        decoder.releaseOutputBuffer(decIndex, false);
                     }
+                    decoder.releaseOutputBuffer(decoderIdx, false);
                 }
 
-                // 3. 从编码器获取输出
-                int encIndex = encoder.dequeueOutputBuffer(encInfo, 10000);
-                if (encIndex >= 0) {
-                    if ((encInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                        encoder.releaseOutputBuffer(encIndex, false);
+                // 编码器输出
+                int encoderIdx = encoder.dequeueOutputBuffer(encInfo, 10000);
+                if (encoderIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    // 获取输出格式
+                    MediaFormat outputFormat = encoder.getOutputFormat();
+                    muxerVideoTrack = muxer.addTrack(outputFormat);
+                    muxer.start();
+                    muxerStarted = true;
+                    Log.d(TAG, "分片" + segmentIndex + ": Muxer启动");
+                } else if (encoderIdx >= 0) {
+                    if (encInfo.size > 0 && muxerStarted) {
+                        ByteBuffer encodedData = encoder.getOutputBuffer(encoderIdx);
 
-                        if (outVideoTrack == -1) {
-                            try {
-                                MediaFormat newFormat = encoder.getOutputFormat();
-                                outVideoTrack = muxer.addTrack(newFormat);
-                                muxer.start();
-                            } catch (Exception e) {
-                                Log.e(TAG, "分片" + segmentIndex + ": 添加轨道失败", e);
-                            }
-                        }
-                        continue;
-                    }
-
-                    if (encInfo.size > 0) {
-                        if (outVideoTrack == -1) {
-                            try {
-                                MediaFormat newFormat = encoder.getOutputFormat();
-                                outVideoTrack = muxer.addTrack(newFormat);
-                                muxer.start();
-                            } catch (Exception e) {
-                                Log.e(TAG, "分片" + segmentIndex + ": 添加轨道失败", e);
-                            }
+                        // 确保时间戳非负
+                        if (encInfo.presentationTimeUs < 0) {
+                            encInfo.presentationTimeUs = 0;
                         }
 
-                        if (outVideoTrack != -1) {
-                            ByteBuffer encodedData = encoder.getOutputBuffer(encIndex);
-                            if (encodedData != null) {
-                                // 关键修复3：从队列中获取原始时间戳，覆盖编码器输出的时间戳
-                                Long originalPts = inputTimestampQueue.poll();
-                                if (originalPts != null) {
-                                    // 使用相对时间戳，而不是原始时间戳
-                                    encInfo.presentationTimeUs = originalPts - startTime; // 关键修改
+                        muxer.writeSampleData(muxerVideoTrack, encodedData, encInfo);
+                        frameCount++;
 
-                                    // 调试日志
-                                    if (frameCount % 100 == 0) {
-                                        Log.v(TAG, String.format("分片%d: 写入第%d帧, 原始PTS=%.3fs, 相对PTS=%.3fs",
-                                                segmentIndex, frameCount, originalPts/1000000.0,
-                                                encInfo.presentationTimeUs/1000000.0));
-                                    }
-                                }
-
-                                muxer.writeSampleData(outVideoTrack, encodedData, encInfo);
-
-                                if (frameCount % 100 == 0) {
-                                    Log.v(TAG, String.format("分片%d: 写入第%d帧, PTS=%.3fs",
-                                            segmentIndex, frameCount, encInfo.presentationTimeUs/1000000.0));
-                                }
-                            }
+                        if (frameCount % 100 == 0) {
+                            Log.v(TAG, String.format("分片%d: 已编码%d帧", segmentIndex, frameCount));
                         }
                     }
 
-                    encoder.releaseOutputBuffer(encIndex, false);
+                    encoder.releaseOutputBuffer(encoderIdx, false);
 
                     if ((encInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                         outputEos = true;
                     }
                 }
-
-                // 超时检查
-                if (System.currentTimeMillis() - startProcessingTime > 60000) {
-                    Log.e(TAG, "分片" + segmentIndex + ": 处理超时");
-                    break;
-                }
             }
 
-            long processingTime = System.currentTimeMillis() - startProcessingTime;
-
-            // 关键日志：显示时间戳范围
-            Log.d(TAG, String.format("分片%d完成: %d帧, 耗时: %.2fs", segmentIndex, frameCount, processingTime/1000.0));
-            Log.d(TAG, String.format("分片%d输入时间戳范围: [%.3fs - %.3fs]",
-                    segmentIndex, firstInputPts/1000000.0, lastInputPts/1000000.0));
-            Log.d(TAG, String.format("分片%d输出时间戳范围: [%.3fs - %.3fs]",
-                    segmentIndex, firstOutputPts/1000000.0, lastOutputPts/1000000.0));
-
-            return frameCount > 0 && outVideoTrack != -1;
+            Log.d(TAG, String.format("分片%d: 完成 %d帧", segmentIndex, frameCount));
+            return frameCount > 0;
 
         } catch (Exception e) {
-            Log.e(TAG, "分片" + segmentIndex + "转码错误", e);
+            Log.e(TAG, "分片" + segmentIndex + "转码失败", e);
             return false;
         } finally {
             // 清理资源
-            if (encoder != null) { try { encoder.stop(); encoder.release(); } catch (Exception e) {} }
-            if (decoder != null) { try { decoder.stop(); decoder.release(); } catch (Exception e) {} }
-            if (muxer != null) { try { muxer.stop(); muxer.release(); } catch (Exception e) {} }
-            if (extractor != null) { try { extractor.release(); } catch (Exception e) {} }
+            try { if (encoder != null) { encoder.stop(); encoder.release(); } } catch (Exception e) {}
+            try { if (decoder != null) { decoder.stop(); decoder.release(); } } catch (Exception e) {}
+            try { if (muxer != null) { muxer.stop(); muxer.release(); } } catch (Exception e) {}
+            try { if (extractor != null) { extractor.release(); } } catch (Exception e) {}
         }
     }
 
