@@ -620,9 +620,11 @@ public class VideoEditor {
 
             // 获取视频信息
             MediaFormat videoFormat = null;
+            int videoTrack = -1;
             for (int i = 0; i < extractor.getTrackCount(); i++) {
                 MediaFormat format = extractor.getTrackFormat(i);
                 if (format.getString(MediaFormat.KEY_MIME).startsWith("video/")) {
+                    videoTrack = i;
                     videoFormat = format;
                     break;
                 }
@@ -644,7 +646,7 @@ public class VideoEditor {
                 return compressToHevcSingleThread(src, dst, ratio);
             } else {
                 Log.d(TAG, "视频较长，使用并行转码");
-                return compressParallelWithOriginalAudio(src, dst, ratio);
+                return compressParallelWithOriginalAudio(src, dst, ratio, videoTrack, duration);
             }
         } catch (Exception e) {
             Log.e(TAG, "compressVideo error", e);
@@ -911,7 +913,8 @@ public class VideoEditor {
     /**
      * 并行转码（用于长视频）
      */
-    public static boolean compressParallelWithOriginalAudio(String src, String dst, double ratio) {
+    public static boolean compressParallelWithOriginalAudio(String src, String dst, double ratio,
+                                                            int videoTrack, long duration) {
         MediaExtractor extractor = null;
         ExecutorService executor = null;
         List<Future<File>> futures = new ArrayList<>();
@@ -926,14 +929,13 @@ public class VideoEditor {
             extractor = new MediaExtractor();
             extractor.setDataSource(src);
 
-            int videoTrack = -1, audioTrack = -1;
+            int audioTrack = -1;
             MediaFormat videoFormat = null, audioFormat = null;
 
             for (int i = 0; i < extractor.getTrackCount(); i++) {
                 MediaFormat format = extractor.getTrackFormat(i);
                 String mime = format.getString(MediaFormat.KEY_MIME);
                 if (mime.startsWith("video/")) {
-                    videoTrack = i;
                     videoFormat = format;
                 } else if (mime.startsWith("audio/")) {
                     audioTrack = i;
@@ -947,8 +949,6 @@ public class VideoEditor {
             }
 
             // 获取视频信息
-            long duration = videoFormat.containsKey(MediaFormat.KEY_DURATION)
-                    ? videoFormat.getLong(MediaFormat.KEY_DURATION) : 0;
             int width = videoFormat.getInteger(MediaFormat.KEY_WIDTH);
             int height = videoFormat.getInteger(MediaFormat.KEY_HEIGHT);
             int frameRate = videoFormat.containsKey(MediaFormat.KEY_FRAME_RATE)
@@ -970,12 +970,10 @@ public class VideoEditor {
             }
 
             // 3. 动态计算线程数和分片大小
-            // 原则：每个分片至少15秒，最多4个线程
-            long minSegmentDuration = 15 * 1000000L; // 15秒
             int availableCores = Runtime.getRuntime().availableProcessors();
             Log.d(TAG, "可用处理器核心数: " + availableCores);
 
-
+            // 大视频（超过5分钟）使用较少线程，避免内存不足
             int maxThreads;
             if (duration > 5 * 60 * 1000000L) { // 超过5分钟
                 maxThreads = Math.max(2, availableCores / 2);
@@ -983,78 +981,49 @@ public class VideoEditor {
                 maxThreads = Math.min(4, availableCores - 1);
             }
 
-            long maxSegmentDuration = 3 * 60 * 1000000L; // 每个分片最多3分钟
-            int optimalThreads = (int) Math.min(
-                    maxThreads,
-                    Math.max(2, (duration + maxSegmentDuration - 1) / maxSegmentDuration)
-            );
+            // 4. 查找关键帧位置
+            Log.d(TAG, "开始查找关键帧位置...");
+            List<Long> keyFramePositions = findKeyFramePositions(src, videoTrack, duration);
 
-            Log.d(TAG, "使用 " + optimalThreads + " 个线程进行并行转码");
+            if (keyFramePositions.size() < 2) {
+                Log.e(TAG, "关键帧数量不足，无法进行并行转码");
+                return false;
+            }
 
-            // 4. 计算分片（基于关键帧）
-            long segmentDuration = duration / optimalThreads;
-            // 在分片计算部分，修改为：
-            extractor.selectTrack(videoTrack);
+            Log.d(TAG, "共找到 " + keyFramePositions.size() + " 个关键帧");
+
+            // 5. 基于关键帧划分分片
+            int optimalThreads = Math.min(maxThreads, keyFramePositions.size() - 1);
             List<Long> segmentStarts = new ArrayList<>();
             List<Long> segmentEnds = new ArrayList<>();
 
-// 首先，收集所有关键帧位置
-            List<Long> keyFramePositions = new ArrayList<>();
-            extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
-            long currentPosition = 0;
-
-            while (currentPosition < duration) {
-                keyFramePositions.add(currentPosition);
-                // 寻找下一个关键帧
-                extractor.seekTo(currentPosition, MediaExtractor.SEEK_TO_NEXT_SYNC);
-                long nextPosition = extractor.getSampleTime();
-                if (nextPosition <= currentPosition || nextPosition >= duration) {
-                    break;
-                }
-                currentPosition = nextPosition;
+            // 确保分片数量合理，每个分片不要太短
+            int framesPerSegment = keyFramePositions.size() / optimalThreads;
+            if (framesPerSegment < 2) {
+                framesPerSegment = 2;
+                optimalThreads = Math.min(keyFramePositions.size() / 2, maxThreads);
             }
 
-// 如果没有找到足够的关键帧，使用平均分片
-            if (keyFramePositions.size() < optimalThreads) {
-                Log.w(TAG, "关键帧数量不足，使用平均分片");
-                for (int i = 0; i < optimalThreads; i++) {
-                    long startTime = i * segmentDuration;
-                    long endTime = (i == optimalThreads - 1) ? duration : (i + 1) * segmentDuration;
-
-                    // 对齐到最近的关键帧
-                    extractor.seekTo(startTime, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
-                    startTime = extractor.getSampleTime();
-                    if (startTime < 0) startTime = i * segmentDuration;
-
-                    // 确保不重叠
-                    if (i > 0 && startTime < segmentEnds.get(i-1)) {
-                        startTime = segmentEnds.get(i-1);
-                    }
-
-                    segmentStarts.add(startTime);
-                    segmentEnds.add(endTime);
-                }
-            } else {
-                // 使用关键帧作为分片边界
-                int framesPerSegment = keyFramePositions.size() / optimalThreads;
-                for (int i = 0; i < optimalThreads; i++) {
-                    int frameIndex = i * framesPerSegment;
-                    long startTime = keyFramePositions.get(frameIndex);
-                    long endTime = (i == optimalThreads - 1) ? duration :
-                            keyFramePositions.get(Math.min(frameIndex + framesPerSegment, keyFramePositions.size() - 1));
-
-                    segmentStarts.add(startTime);
-                    segmentEnds.add(endTime);
-                }
-            }
+            Log.d(TAG, "使用 " + optimalThreads + " 个线程进行并行转码，每段 " + framesPerSegment + " 个关键帧");
 
             for (int i = 0; i < optimalThreads; i++) {
-                Log.d(TAG, String.format("分片%d: %.3fs - %.3fs (时长: %.3fs)",
-                        i, segmentStarts.get(i)/1000000.0, segmentEnds.get(i)/1000000.0,
-                        (segmentEnds.get(i) - segmentStarts.get(i))/1000000.0));
+                int startIdx = i * framesPerSegment;
+                int endIdx = (i == optimalThreads - 1)
+                        ? keyFramePositions.size() - 1
+                        : Math.min((i + 1) * framesPerSegment, keyFramePositions.size() - 1);
+
+                long startTime = keyFramePositions.get(startIdx);
+                long endTime = keyFramePositions.get(endIdx);
+
+                segmentStarts.add(startTime);
+                segmentEnds.add(endTime);
+
+                Log.d(TAG, String.format("分片%d: %.3fs - %.3fs (时长: %.3fs, 关键帧范围: %d-%d)",
+                        i, startTime/1000000.0, endTime/1000000.0,
+                        (endTime - startTime)/1000000.0, startIdx, endIdx));
             }
 
-            // 5. 并行转码每个分片
+            // 6. 并行转码每个分片
             executor = Executors.newFixedThreadPool(optimalThreads);
             final int finalTargetBitrate = targetBitrate;
             final MediaFormat finalVideoFormat = videoFormat;
@@ -1120,7 +1089,7 @@ public class VideoEditor {
                 }));
             }
 
-            // 6. 等待所有分片完成，设置超时
+            // 7. 等待所有分片完成，设置超时
             boolean allSegmentsSuccess = true;
             for (int i = 0; i < futures.size(); i++) {
                 try {
@@ -1156,7 +1125,7 @@ public class VideoEditor {
 
             executor.shutdown();
 
-            // 7. 合并视频分片
+            // 8. 合并视频分片
             mergedVideoFile = File.createTempFile("merged_video_", ".mp4", getCacheDir());
 
             boolean mergeSuccess = mergeVideoSegments(videoSegments, mergedVideoFile.getAbsolutePath(), segmentStarts);
@@ -1168,14 +1137,14 @@ public class VideoEditor {
 
             Log.d(TAG, "视频分片合并成功，大小: " + mergedVideoFile.length() / 1024 + "KB");
 
-            // 8. 合并音频和视频
+            // 9. 合并音频和视频
             boolean finalMergeSuccess = mergeAudioAndVideo(
                     mergedVideoFile.getAbsolutePath(),
                     audioFile != null ? audioFile.getAbsolutePath() : null,
                     dst
             );
 
-            // 9. 清理临时文件
+            // 10. 清理临时文件
             cleanupTempFiles(videoSegments, mergedVideoFile, audioFile);
 
             Log.d(TAG, "并行转码完成，结果: " + finalMergeSuccess);
@@ -1194,6 +1163,116 @@ public class VideoEditor {
                 }
             } catch (Exception e) {
                 Log.e(TAG, "释放资源失败", e);
+            }
+        }
+    }
+
+    /**
+     * 查找视频中的关键帧位置
+     * @param dataSource 视频文件路径
+     * @param videoTrack 视频轨道索引
+     * @param duration 视频总时长（微秒）
+     * @return 关键帧位置列表（微秒）
+     */
+    private static List<Long> findKeyFramePositions(String dataSource, int videoTrack, long duration) {
+        List<Long> keyFrames = new ArrayList<>();
+        MediaExtractor extractor = null;
+
+        try {
+            // 创建新的Extractor来查找关键帧
+            extractor = new MediaExtractor();
+            extractor.setDataSource(dataSource);
+
+            extractor.selectTrack(videoTrack);
+
+            // 定位到开始位置
+            extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+
+            long currentPos = 0;
+            int maxKeyFrames = 1000; // 最多检测1000个关键帧
+            int sampleCount = 0;
+
+            Log.d(TAG, "开始扫描关键帧...");
+
+            while (currentPos < duration && keyFrames.size() < maxKeyFrames && sampleCount < maxKeyFrames * 10) {
+                long sampleTime = extractor.getSampleTime();
+                int sampleFlags = extractor.getSampleFlags();
+
+                // 检查是否为关键帧（I帧）
+                if ((sampleFlags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                    keyFrames.add(sampleTime);
+                    if (keyFrames.size() % 10 == 0) {
+                        Log.v(TAG, String.format("找到第%d个关键帧: %.3fs",
+                                keyFrames.size(), sampleTime/1000000.0));
+                    }
+                }
+
+                // 前进到下一帧
+                if (!extractor.advance()) {
+                    break; // 无法前进，可能已到文件末尾
+                }
+
+                // 获取新的时间位置
+                long newPos = extractor.getSampleTime();
+                if (newPos < 0) {
+                    break; // 到达文件末尾
+                }
+
+                currentPos = newPos;
+                sampleCount++;
+
+                // 每1000帧输出一次进度
+                if (sampleCount % 1000 == 0) {
+                    Log.v(TAG, String.format("已扫描%d帧，找到%d个关键帧",
+                            sampleCount, keyFrames.size()));
+                }
+            }
+
+            // 如果没有找到关键帧，添加开始位置作为默认关键帧
+            if (keyFrames.isEmpty()) {
+                Log.w(TAG, "未找到关键帧，使用0作为起始位置");
+                keyFrames.add(0L);
+            } else {
+                // 确保包含视频开始位置
+                if (keyFrames.get(0) > 0) {
+                    keyFrames.add(0, 0L);
+                }
+
+                // 确保包含视频结束位置
+                long lastKeyFrame = keyFrames.get(keyFrames.size() - 1);
+                if (lastKeyFrame < duration) {
+                    // 如果最后一个关键帧比视频结束时间早很多，添加结束时间
+                    if (duration - lastKeyFrame > 1000000) { // 超过1秒
+                        keyFrames.add(duration);
+                    }
+                }
+            }
+
+            Log.d(TAG, String.format("关键帧扫描完成: 共扫描%d帧，找到%d个关键帧",
+                    sampleCount, keyFrames.size()));
+
+            // 输出前10个关键帧信息用于调试
+            int showCount = Math.min(10, keyFrames.size());
+            for (int i = 0; i < showCount; i++) {
+                Log.d(TAG, String.format("关键帧%d: %.3fs", i, keyFrames.get(i)/1000000.0));
+            }
+
+            return keyFrames;
+
+        } catch (Exception e) {
+            Log.e(TAG, "查找关键帧失败: " + e.getMessage(), e);
+            // 返回一个基本的关键帧列表（开始和结束）
+            keyFrames.clear();
+            keyFrames.add(0L);
+            keyFrames.add(duration);
+            return keyFrames;
+        } finally {
+            if (extractor != null) {
+                try {
+                    extractor.release();
+                } catch (Exception e) {
+                    Log.e(TAG, "释放关键帧查找器失败", e);
+                }
             }
         }
     }
