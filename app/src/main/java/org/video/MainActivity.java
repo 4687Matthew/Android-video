@@ -5,6 +5,8 @@ import android.app.Activity;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -62,6 +64,11 @@ public class MainActivity extends AppCompatActivity {
     private String selectedVideoPath;
     private String selectedSecondVideoPath;
 
+    // 进度回调接口 - 保持不变
+    public interface ProgressCallback {
+        void onProgressUpdate(String status, int progress);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -94,28 +101,33 @@ public class MainActivity extends AppCompatActivity {
         tvSecondVideoPath = findViewById(R.id.tvSecondVideoPath);
         tvStatus = findViewById(R.id.tvStatus);
         progressBar = findViewById(R.id.progressBar);
+
+        // 设置进度条为水平样式
+        progressBar.setIndeterminate(false);
+        progressBar.setMax(100);
     }
+
     private void checkPermissions() {
         List<String> permissions = new ArrayList<>();
-        
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) 
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO)
                     != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.READ_MEDIA_VIDEO);
             }
         } else {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) 
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
                     != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE);
             }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) 
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
                     != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
             }
         }
 
         if (!permissions.isEmpty()) {
-            ActivityCompat.requestPermissions(this, 
+            ActivityCompat.requestPermissions(this,
                     permissions.toArray(new String[0]), REQUEST_PERMISSION_CODE);
         }
     }
@@ -134,22 +146,30 @@ public class MainActivity extends AppCompatActivity {
         btnSpeedDown.setOnClickListener(v -> adjustSpeed(false));
     }
 
+    /**
+     * 串行压缩（基础版）- 已添加进度反馈
+     */
     private void compressHevcBase() {
-        if (selectedVideoPath == null) { showToast("请先选择视频"); return; }
+        if (selectedVideoPath == null) {
+            showToast("请先选择视频");
+            return;
+        }
 
-        // 检查文件是否存在
         File inputFile = new File(selectedVideoPath);
         if (!inputFile.exists()) {
             showToast("输入文件不存在");
             return;
         }
 
-        String fileName = "hevc_" + System.currentTimeMillis() + ".mp4";
+        String baseName = inputFile.getName();
+        int dot = baseName.lastIndexOf('.');
+        String ext = dot >= 0 ? baseName.substring(dot) : ".mp4";
+        String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
+        String fileName = pureName + "_base_hevc" + ext;
+
         String outPath;
         try {
             outPath = createPublicVideoFile(fileName);
-
-            // 检查输出目录是否可写
             File outFile = new File(outPath);
             File parentDir = outFile.getParentFile();
             if (!parentDir.exists()) {
@@ -160,49 +180,80 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        // 显示进度条和状态
         showProgress(true);
-        tvStatus.setText("正在压缩视频...");
+        progressBar.setProgress(0);
+        tvStatus.setText("正在使用串行方式压缩视频...");
 
+        // 创建进度回调
+        MainActivity.ProgressCallback progressCallback = (status, progress) -> runOnUiThread(() -> {
+            if (status != null && !status.isEmpty()) {
+                tvStatus.setText(status);
+            }
+            if (progress >= 0) {
+                progressBar.setProgress(progress);
+            }
+        });
+
+        // 在新线程中执行压缩
         new Thread(() -> {
-            boolean ok = VideoEditor.compressToHevc(selectedVideoPath, outPath, 0.45);
+            // 直接调用单线程转码方法
+            boolean ok = VideoEditor.compressToHevcSingleThread(
+                    selectedVideoPath, outPath, 0.45, progressCallback, 0);
+
             runOnUiThread(() -> {
                 showProgress(false);
                 if (ok) {
-                    // 检查输出文件是否存在且有内容
                     File outputFile = new File(outPath);
                     if (outputFile.exists() && outputFile.length() > 0) {
                         scanMediaFile(outPath);
-                        tvStatus.setText("压缩完成，文件大小: " +
-                                (outputFile.length() / 1024 / 1024) + "MB");
-                        showToast("压缩完成");
+                        long originalSize = inputFile.length();
+                        long compressedSize = outputFile.length();
+                        double ratio = (double) compressedSize / originalSize * 100;
+
+                        tvStatus.setText(String.format(
+                                "串行压缩完成！原始大小: %.1fMB, 压缩后: %.1fMB, 压缩比: %.1f%%",
+                                originalSize/(1024.0*1024.0),
+                                compressedSize/(1024.0*1024.0),
+                                ratio));
+                        progressBar.setProgress(100);
+                        showToast("串行压缩完成");
                     } else {
                         tvStatus.setText("压缩失败：输出文件为空");
                         showToast("压缩失败：输出文件为空");
                     }
                 } else {
-                    tvStatus.setText("压缩失败");
-                    showToast("压缩失败");
+                    tvStatus.setText("串行压缩失败");
+                    showToast("串行压缩失败");
                 }
             });
         }).start();
     }
 
+    /**
+     * 并行压缩（智能选择）- 已添加进度反馈
+     */
     private void compressHevc() {
-        if (selectedVideoPath == null) { showToast("请先选择视频"); return; }
+        if (selectedVideoPath == null) {
+            showToast("请先选择视频");
+            return;
+        }
 
-        // 检查文件是否存在
         File inputFile = new File(selectedVideoPath);
         if (!inputFile.exists()) {
             showToast("输入文件不存在");
             return;
         }
 
-        String fileName = "hevc_" + System.currentTimeMillis() + ".mp4";
+        String baseName = inputFile.getName();
+        int dot = baseName.lastIndexOf('.');
+        String ext = dot >= 0 ? baseName.substring(dot) : ".mp4";
+        String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
+        String fileName = pureName + "_parallel_hevc" + ext;
+
         String outPath;
         try {
             outPath = createPublicVideoFile(fileName);
-
-            // 检查输出目录是否可写
             File outFile = new File(outPath);
             File parentDir = outFile.getParentFile();
             if (!parentDir.exists()) {
@@ -213,21 +264,42 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        // 显示进度条和状态
         showProgress(true);
-        tvStatus.setText("正在压缩视频...");
+        progressBar.setProgress(0);
+        tvStatus.setText("开始压缩视频...");
 
+        // 创建进度回调
+        MainActivity.ProgressCallback progressCallback = (status, progress) -> runOnUiThread(() -> {
+            if (status != null && !status.isEmpty()) {
+                tvStatus.setText(status);
+            }
+            if (progress >= 0) {
+                progressBar.setProgress(progress);
+            }
+        });
+
+        // 在新线程中执行智能压缩
         new Thread(() -> {
-            boolean ok = VideoEditor.compressVideo(selectedVideoPath, outPath, 0.45);
-//            boolean ok = VideoEditor.compressToHevc(selectedVideoPath, outPath, 0.45);
+            boolean success = VideoEditor.compressVideo(
+                    selectedVideoPath, outPath, 0.45, progressCallback);
+
             runOnUiThread(() -> {
                 showProgress(false);
-                if (ok) {
-                    // 检查输出文件是否存在且有内容
+                if (success) {
                     File outputFile = new File(outPath);
                     if (outputFile.exists() && outputFile.length() > 0) {
                         scanMediaFile(outPath);
-                        tvStatus.setText("压缩完成，文件大小: " +
-                                (outputFile.length() / 1024 / 1024) + "MB");
+                        long originalSize = inputFile.length();
+                        long compressedSize = outputFile.length();
+                        double ratio = (double) compressedSize / originalSize * 100;
+
+                        tvStatus.setText(String.format(
+                                "压缩完成！原始大小: %.1fMB, 压缩后: %.1fMB, 压缩比: %.1f%%",
+                                originalSize/(1024.0*1024.0),
+                                compressedSize/(1024.0*1024.0),
+                                ratio));
+                        progressBar.setProgress(100);
                         showToast("压缩完成");
                     } else {
                         tvStatus.setText("压缩失败：输出文件为空");
@@ -246,10 +318,15 @@ public class MainActivity extends AppCompatActivity {
             showToast("请先选择视频");
             return;
         }
+        showProgress(true);
+        tvStatus.setText("正在获取视频信息...");
+
         new Thread(() -> {
             String info = VideoEditor.getVideoInfo(selectedVideoPath);
             runOnUiThread(() -> {
                 VideoInfo.setText(info);
+                showProgress(false);
+                tvStatus.setText("视频信息获取完成");
             });
         }).start();
     }
@@ -263,7 +340,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        
+
         if (resultCode == Activity.RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri != null) {
@@ -307,9 +384,9 @@ public class MainActivity extends AppCompatActivity {
             tvStatus.setText("正在裁剪视频...");
 
             new Thread(() -> {
-                boolean success = VideoEditor.cropVideo(selectedVideoPath, outputPath, 
+                boolean success = VideoEditor.cropVideo(selectedVideoPath, outputPath,
                         (long)(startTime * 1000000), (long)(endTime * 1000000));
-                
+
                 runOnUiThread(() -> {
                     showProgress(false);
                     if (success) {
@@ -317,7 +394,6 @@ public class MainActivity extends AppCompatActivity {
                         if (savedPath != null) {
                             tvStatus.setText("裁剪成功: " + new File(savedPath).getName());
                             showToast("裁剪成功，已保存到相册");
-                            // 通知媒体库更新
                             scanMediaFile(savedPath);
                         } else {
                             tvStatus.setText("裁剪成功: " + new File(outputPath).getName());
@@ -351,14 +427,14 @@ public class MainActivity extends AppCompatActivity {
             double splitTime = Double.parseDouble(splitTimeStr);
             String outputPath1 = getOutputPath("split1_" + System.currentTimeMillis() + ".mp4");
             String outputPath2 = getOutputPath("split2_" + System.currentTimeMillis() + ".mp4");
-            
+
             showProgress(true);
             tvStatus.setText("正在分割视频...");
 
             new Thread(() -> {
-                boolean success = VideoEditor.splitVideo(selectedVideoPath, outputPath1, 
+                boolean success = VideoEditor.splitVideo(selectedVideoPath, outputPath1,
                         outputPath2, (long)(splitTime * 1000000));
-                
+
                 runOnUiThread(() -> {
                     showProgress(false);
                     if (success) {
@@ -398,7 +474,7 @@ public class MainActivity extends AppCompatActivity {
         new Thread(() -> {
             boolean success = VideoEditor.mergeVideos(
                     new String[]{selectedVideoPath, selectedSecondVideoPath}, outputPath);
-            
+
             runOnUiThread(() -> {
                 showProgress(false);
                 if (success) {
@@ -426,7 +502,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
         String speedStr = etSpeedFactor.getText().toString();
-        double defaultSpeedFactor = speedUp ? 2.0 : 0.5; // 默认快放2倍，慢放0.5倍
+        double defaultSpeedFactor = speedUp ? 2.0 : 0.5;
         double speedFactor = defaultSpeedFactor;
 
         if (!speedStr.isEmpty()) {
@@ -443,19 +519,19 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        final double finalSpeedFactor = speedFactor; // 创建final变量供lambda使用
-        String outputPath = getOutputPath((speedUp ? "speedup_" : "slowdown_") + 
+        final double finalSpeedFactor = speedFactor;
+        String outputPath = getOutputPath((speedUp ? "speedup_" : "slowdown_") +
                 System.currentTimeMillis() + ".mp4");
         showProgress(true);
         tvStatus.setText("正在调节速度...");
 
         new Thread(() -> {
             boolean success = VideoEditor.adjustSpeed(selectedVideoPath, outputPath, finalSpeedFactor);
-            
+
             runOnUiThread(() -> {
                 showProgress(false);
                 if (success) {
-                    String savedPath = saveToPublicDirectory(outputPath, 
+                    String savedPath = saveToPublicDirectory(outputPath,
                             (speedUp ? "speedup_" : "slowdown_") + System.currentTimeMillis() + ".mp4");
                     if (savedPath != null) {
                         tvStatus.setText("速度调节成功: " + new File(savedPath).getName());
@@ -474,7 +550,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String getOutputPath(String filename) {
-        // 先保存到应用私有目录，处理完成后再复制到公共目录
         File outputDir = new File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "edited");
         if (!outputDir.exists()) {
             outputDir.mkdirs();
@@ -482,9 +557,6 @@ public class MainActivity extends AppCompatActivity {
         return new File(outputDir, filename).getAbsolutePath();
     }
 
-    /**
-     * 将文件保存到公共目录（Movies），这样用户可以在相册中看到
-     */
     private String saveToPublicDirectory(String sourcePath, String filename) {
         try {
             File sourceFile = new File(sourcePath);
@@ -493,7 +565,6 @@ public class MainActivity extends AppCompatActivity {
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10+ 使用 MediaStore API
                 ContentValues values = new ContentValues();
                 values.put(MediaStore.Video.Media.DISPLAY_NAME, filename);
                 values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
@@ -514,7 +585,6 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
             } else {
-                // Android 9 及以下使用传统方式
                 File moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES);
                 File videoEditorDir = new File(moviesDir, "VideoEditor");
                 if (!videoEditorDir.exists()) {
@@ -539,12 +609,8 @@ public class MainActivity extends AppCompatActivity {
         return null;
     }
 
-    /**
-     * 通知媒体库扫描新文件
-     */
     private void scanMediaFile(String filePath) {
         if (filePath.startsWith("content://")) {
-            // MediaStore URI，不需要扫描
             return;
         }
         try {
@@ -559,34 +625,32 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showProgress(boolean show) {
-        progressBar.setVisibility(show ? View.VISIBLE : View.GONE);
+        runOnUiThread(() -> {
+            progressBar.setVisibility(show ? View.VISIBLE : View.GONE);
+            tvStatus.setVisibility(View.VISIBLE);
+            if (!show) {
+                progressBar.setProgress(0);
+            }
+        });
     }
 
     private void showToast(String message) {
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+        runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_SHORT).show());
     }
 
-    /**
-     * 一步到位：创建位于 Movies/VideoEditor 的空文件，并返回其 **真实文件路径**。
-     * Android 10+ 用 MediaStore；Android 9- 用传统路径。
-     * 返回的 File 已 createNewFile()，可直接作为 ffmpeg/MediaMuxer 输出。
-     */
     private String createPublicVideoFile(String fileName) throws IOException {
         File targetFile;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // Android 10+ 方案：MediaStore 返回真实路径
             ContentValues values = new ContentValues();
             values.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
             values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
             values.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/VideoEditor");
             Uri uri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
-            // 通过 openFileDescriptor 拿到可写 fd，再转 File 路径
             ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "w");
             targetFile = new File("/storage/emulated/0/" +
                     Environment.DIRECTORY_MOVIES + "/VideoEditor/" + fileName);
-            pfd.close();          // 先关闭，后面 MediaMuxer/FFmpeg 会重新打开
+            pfd.close();
         } else {
-            // Android 9- 传统路径
             File movies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES);
             File dir = new File(movies, "VideoEditor");
             if (!dir.exists()) dir.mkdirs();
@@ -597,8 +661,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
-    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, 
-            @NonNull int[] grantResults) {
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQUEST_PERMISSION_CODE) {
             for (int result : grantResults) {
