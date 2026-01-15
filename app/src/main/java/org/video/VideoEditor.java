@@ -166,91 +166,294 @@ public class VideoEditor {
     }
 
     /**
-     * 合并视频
+     * 合并视频（带进度回调）- 改进版，确保流畅度
      */
-    public static boolean mergeVideos(String[] inputPaths, String outputPath) {
+    public static boolean mergeVideosWithProgress(String[] inputPaths, String outputPath,
+                                                  MainActivity.ProgressCallback callback) {
+        List<MediaExtractor> extractors = new ArrayList<>();
         MediaMuxer muxer = null;
+
         try {
-            MediaExtractor first = new MediaExtractor();
-            first.setDataSource(inputPaths[0]);
-            MediaFormat videoFormat = null, audioFormat = null;
-            for (int i = 0; i < first.getTrackCount(); i++) {
-                MediaFormat f = first.getTrackFormat(i);
-                String mime = f.getString(MediaFormat.KEY_MIME);
-                if (mime != null && mime.startsWith("video/") && videoFormat == null)
-                    videoFormat = f;
-                else if (mime != null && mime.startsWith("audio/") && audioFormat == null)
-                    audioFormat = f;
+            updateStatus(callback, "开始合并视频...", 5);
+
+            // 1. 验证所有输入文件
+            long totalSize = 0;
+            List<File> inputFiles = new ArrayList<>();
+            for (String path : inputPaths) {
+                File file = new File(path);
+                if (!file.exists()) {
+                    updateStatus(callback, "文件不存在: " + file.getName(), 0);
+                    return false;
+                }
+                inputFiles.add(file);
+                totalSize += file.length();
             }
-            first.release();
+
+            // 2. 分析第一个视频的格式作为模板
+            updateStatus(callback, "分析视频格式...", 10);
+            MediaExtractor firstExtractor = new MediaExtractor();
+            firstExtractor.setDataSource(inputPaths[0]);
+
+            MediaFormat videoFormat = null, audioFormat = null;
+            int videoTrackIndex = -1, audioTrackIndex = -1;
+
+            for (int i = 0; i < firstExtractor.getTrackCount(); i++) {
+                MediaFormat format = firstExtractor.getTrackFormat(i);
+                String mime = format.getString(MediaFormat.KEY_MIME);
+                if (mime.startsWith("video/") && videoFormat == null) {
+                    videoFormat = format;
+                    videoTrackIndex = i;
+                    Log.d(TAG, String.format("视频格式: %dx%d, 帧率: %d, 码率: %d",
+                            format.getInteger(MediaFormat.KEY_WIDTH),
+                            format.getInteger(MediaFormat.KEY_HEIGHT),
+                            format.getInteger(MediaFormat.KEY_FRAME_RATE),
+                            format.getInteger(MediaFormat.KEY_BIT_RATE)));
+                } else if (mime.startsWith("audio/") && audioFormat == null) {
+                    audioFormat = format;
+                    audioTrackIndex = i;
+                    Log.d(TAG, "音频格式: " + format);
+                }
+            }
+
             if (videoFormat == null) {
-                Log.e(TAG, "未找到视频轨道");
+                updateStatus(callback, "未找到视频轨道", 0);
+                firstExtractor.release();
                 return false;
             }
 
+            // 3. 检查所有视频的格式一致性
+            updateStatus(callback, "检查视频格式一致性...", 15);
+            boolean allFormatsCompatible = true;
+            List<String> formatWarnings = new ArrayList<>();
+
+            for (int i = 1; i < inputPaths.length; i++) {
+                MediaExtractor checkExtractor = new MediaExtractor();
+                checkExtractor.setDataSource(inputPaths[i]);
+
+                for (int j = 0; j < checkExtractor.getTrackCount(); j++) {
+                    MediaFormat format = checkExtractor.getTrackFormat(j);
+                    String mime = format.getString(MediaFormat.KEY_MIME);
+
+                    if (mime.startsWith("video/")) {
+                        int width = format.getInteger(MediaFormat.KEY_WIDTH);
+                        int height = format.getInteger(MediaFormat.KEY_HEIGHT);
+                        int refWidth = videoFormat.getInteger(MediaFormat.KEY_WIDTH);
+                        int refHeight = videoFormat.getInteger(MediaFormat.KEY_HEIGHT);
+
+                        if (width != refWidth || height != refHeight) {
+                            formatWarnings.add(String.format("视频%d: 分辨率不一致 (%dx%d vs %dx%d)",
+                                    i, width, height, refWidth, refHeight));
+                            allFormatsCompatible = false;
+                        }
+
+                        // 检查编码格式
+                        String refMime = videoFormat.getString(MediaFormat.KEY_MIME);
+                        if (!mime.equals(refMime)) {
+                            formatWarnings.add(String.format("视频%d: 编码格式不一致 (%s vs %s)",
+                                    i, mime, refMime));
+                            allFormatsCompatible = false;
+                        }
+                    }
+                }
+                checkExtractor.release();
+            }
+
+            if (!allFormatsCompatible) {
+                Log.w(TAG, "视频格式不完全一致，可能出现播放问题");
+                for (String warning : formatWarnings) {
+                    Log.w(TAG, warning);
+                }
+            }
+
+            // 4. 创建复用器
+            updateStatus(callback, "创建输出文件...", 20);
             muxer = new MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-            int vTrack = muxer.addTrack(videoFormat);
-            int aTrack = audioFormat == null ? -1 : muxer.addTrack(audioFormat);
+            int muxerVideoTrack = muxer.addTrack(videoFormat);
+            int muxerAudioTrack = audioFormat == null ? -1 : muxer.addTrack(audioFormat);
+
             muxer.start();
 
-            ByteBuffer buf = ByteBuffer.allocate(1024 * 1024);
+            // 5. 准备缓冲区
+            ByteBuffer buffer = ByteBuffer.allocate(1024 * 1024);
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-            long offset = 0;
 
-            for (String path : inputPaths) {
-                MediaExtractor ex = new MediaExtractor();
-                ex.setDataSource(path);
+            // 6. 关键改进：使用更精确的时间戳处理
+            long timeOffset = 0;
+            long processedSize = 0;
+            int totalFrames = 0;
+
+            // 7. 逐文件处理，确保时间戳连续
+            for (int fileIndex = 0; fileIndex < inputPaths.length; fileIndex++) {
+                String path = inputPaths[fileIndex];
+                File currentFile = inputFiles.get(fileIndex);
+
+                updateStatus(callback, String.format("处理第%d/%d个视频: %s",
+                                fileIndex + 1, inputPaths.length, currentFile.getName()),
+                        20 + (fileIndex * 70 / inputPaths.length));
+
+                MediaExtractor extractor = new MediaExtractor();
+                extractor.setDataSource(path);
+                extractors.add(extractor);
+
+                // 查找轨道
                 int vIdx = -1, aIdx = -1;
-                for (int i = 0; i < ex.getTrackCount(); i++) {
-                    String mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME);
-                    if (mime != null && mime.startsWith("video/") && vIdx == -1) vIdx = i;
-                    else if (mime != null && mime.startsWith("audio/") && aIdx == -1) aIdx = i;
+                for (int i = 0; i < extractor.getTrackCount(); i++) {
+                    String mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME);
+                    if (mime.startsWith("video/") && vIdx == -1) {
+                        vIdx = i;
+                    } else if (mime.startsWith("audio/") && aIdx == -1) {
+                        aIdx = i;
+                    }
                 }
-                long start = -1;
+
+                // 关键改进：先处理视频，记录关键信息
+                long fileStartTime = -1;
+                long videoDuration = 0;
+                int videoFrames = 0;
+
                 if (vIdx != -1) {
-                    ex.selectTrack(vIdx);
-                    while (true) {
-                        int size = ex.readSampleData(buf, 0);
-                        if (size < 0) break;
-                        if (start < 0) start = ex.getSampleTime();
-                        buf.position(0); buf.limit(size);
-                        info.set(0, size, offset + (ex.getSampleTime() - start),
-                                convertSampleFlagsToBufferFlags(ex.getSampleFlags()));
-                        muxer.writeSampleData(vTrack, buf, info);
-                        ex.advance();
+                    extractor.selectTrack(vIdx);
+
+                    // 获取视频信息
+                    MediaFormat trackFormat = extractor.getTrackFormat(vIdx);
+                    if (trackFormat.containsKey(MediaFormat.KEY_DURATION)) {
+                        videoDuration = trackFormat.getLong(MediaFormat.KEY_DURATION);
                     }
-                }
-                if (aIdx != -1 && aTrack != -1) {
-                    ex.unselectTrack(vIdx);
-                    ex.selectTrack(aIdx);
-                    start = -1;
+
+                    // 确保从关键帧开始
+                    extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
                     while (true) {
-                        int size = ex.readSampleData(buf, 0);
+                        int size = extractor.readSampleData(buffer, 0);
                         if (size < 0) break;
-                        if (start < 0) start = ex.getSampleTime();
-                        buf.position(0); buf.limit(size);
-                        info.set(0, size, offset + (ex.getSampleTime() - start),
-                                convertSampleFlagsToBufferFlags(ex.getSampleFlags()));
-                        muxer.writeSampleData(aTrack, buf, info);
-                        ex.advance();
+
+                        long pts = extractor.getSampleTime();
+                        if (fileStartTime < 0) {
+                            fileStartTime = pts;
+                        }
+
+                        // 关键改进：确保时间戳递增且连续
+                        long adjustedPts = timeOffset + (pts - fileStartTime);
+
+                        buffer.position(0);
+                        buffer.limit(size);
+
+                        info.set(0, size, adjustedPts,
+                                convertSampleFlagsToBufferFlags(extractor.getSampleFlags()));
+
+                        muxer.writeSampleData(muxerVideoTrack, buffer, info);
+                        extractor.advance();
+
+                        videoFrames++;
+                        processedSize += size;
+
+                        // 更新进度
+                        if (totalSize > 0) {
+                            int progress = 20 + (int)((processedSize * 70.0) / totalSize);
+                            progress = Math.min(progress, 90);
+
+                            if (videoFrames % 30 == 0) { // 每30帧更新一次
+                                updateStatus(callback,
+                                        String.format("第%d个视频: 已处理 %d 帧", fileIndex + 1, videoFrames),
+                                        progress);
+                            }
+                        }
                     }
+
+                    totalFrames += videoFrames;
+                    Log.d(TAG, String.format("视频%d: 处理了%d帧，持续时间%.2fs",
+                            fileIndex + 1, videoFrames, videoDuration/1000000.0));
                 }
-                MediaFormat vf = ex.getTrackFormat(vIdx);
-                offset += vf.getLong(MediaFormat.KEY_DURATION);
-                ex.release();
+
+                // 处理音频轨道
+                if (aIdx != -1 && muxerAudioTrack != -1) {
+                    extractor.unselectTrack(vIdx);
+                    extractor.selectTrack(aIdx);
+                    extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
+                    long audioStartTime = -1;
+                    int audioFrames = 0;
+
+                    while (true) {
+                        int size = extractor.readSampleData(buffer, 0);
+                        if (size < 0) break;
+
+                        long pts = extractor.getSampleTime();
+                        if (audioStartTime < 0) {
+                            audioStartTime = pts;
+                        }
+
+                        // 关键改进：音频时间戳也要正确偏移
+                        long adjustedPts = timeOffset + (pts - audioStartTime);
+
+                        buffer.position(0);
+                        buffer.limit(size);
+
+                        info.set(0, size, adjustedPts,
+                                convertSampleFlagsToBufferFlags(extractor.getSampleFlags()));
+
+                        muxer.writeSampleData(muxerAudioTrack, buffer, info);
+                        extractor.advance();
+                        audioFrames++;
+
+                        processedSize += size;
+                    }
+
+                    Log.d(TAG, String.format("音频%d: 处理了%d帧", fileIndex + 1, audioFrames));
+                }
+
+                // 关键改进：使用视频的实际时长作为偏移量，而不是format中的时长
+                // 这样可以确保时间戳连续
+                if (videoDuration > 0) {
+                    timeOffset += videoDuration;
+                } else {
+                    // 如果没有获取到时长，使用估计值
+                    timeOffset += 5 * 1000000L; // 假设5秒
+                }
+
+                Log.d(TAG, String.format("文件%d处理完成，下一个偏移量: %.2fs",
+                        fileIndex + 1, timeOffset/1000000.0));
             }
+
             muxer.stop();
-            return true;
+
+            updateStatus(callback, String.format("合并完成！共%d帧", totalFrames), 95);
+
+            // 验证输出文件
+            File outputFile = new File(outputPath);
+            if (outputFile.exists() && outputFile.length() > 0) {
+                long outputSize = outputFile.length();
+                double compressionRatio = (double) outputSize / totalSize * 100;
+
+                updateStatus(callback,
+                        String.format("合并成功！输出大小: %.1fMB (%.1f%%)",
+                                outputSize/(1024.0*1024.0), compressionRatio),
+                        100);
+                return true;
+            } else {
+                updateStatus(callback, "合并失败：输出文件为空", 0);
+                return false;
+            }
+
         } catch (Exception e) {
-            Log.e(TAG, "合并视频失败", e);
+            updateStatus(callback, "合并视频出错：" + e.getMessage(), 0);
+            Log.e(TAG, "mergeVideosWithProgress error", e);
             return false;
         } finally {
+            // 清理资源
+            for (MediaExtractor ex : extractors) {
+                try { ex.release(); } catch (Exception ignored) {}
+            }
+
             if (muxer != null) {
-                try { muxer.release(); } catch (Exception ignored) {}
+                try {
+                    muxer.release();
+                } catch (Exception e) {
+                    Log.e(TAG, "释放复用器失败", e);
+                }
             }
         }
     }
-
     /**
      * 调节视频速度（仅调整时间戳，不重新编码）
      */

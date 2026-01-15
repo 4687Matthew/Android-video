@@ -468,17 +468,34 @@ public class MainActivity extends AppCompatActivity {
         }
 
         String outputPath = getOutputPath("merged_" + System.currentTimeMillis() + ".mp4");
-        showProgress(true);
-        tvStatus.setText("正在合并视频...");
 
+        // 显示进度条和状态
+        showProgress(true);
+        progressBar.setProgress(0);
+        tvStatus.setText("开始合并视频...");
+
+        // 创建进度回调
+        ProgressCallback progressCallback = (status, progress) -> runOnUiThread(() -> {
+            if (status != null && !status.isEmpty()) {
+                tvStatus.setText(status);
+            }
+            if (progress >= 0) {
+                progressBar.setProgress(progress);
+            }
+        });
+
+        // 在新线程中执行合并
         new Thread(() -> {
-            boolean success = VideoEditor.mergeVideos(
-                    new String[]{selectedVideoPath, selectedSecondVideoPath}, outputPath);
+            boolean success = VideoEditor.mergeVideosWithProgress(
+                    new String[]{selectedVideoPath, selectedSecondVideoPath},
+                    outputPath,
+                    progressCallback);
 
             runOnUiThread(() -> {
                 showProgress(false);
                 if (success) {
-                    String savedPath = saveToPublicDirectory(outputPath, "merged_" + System.currentTimeMillis() + ".mp4");
+                    String savedPath = saveToPublicDirectory(outputPath,
+                            "merged_" + System.currentTimeMillis() + ".mp4");
                     if (savedPath != null) {
                         tvStatus.setText("合并成功: " + new File(savedPath).getName());
                         showToast("合并成功，已保存到相册");
