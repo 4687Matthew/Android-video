@@ -174,7 +174,6 @@ public class VideoEditor {
                 totalSamples = 0;
                 lastProgressUpdate = System.currentTimeMillis();
                 firstPts = -1;
-                processedDuration = 0;
 
                 while (true) {
                     int size = extractor.readSampleData(buffer, 0);
@@ -254,6 +253,426 @@ public class VideoEditor {
         }
     }
 
+    // 在 VideoEditor 类中添加这些常量和方法
+    private static final double HIGH_BFRAME_THRESHOLD = 0.8; // B帧比例超过80%认为是高B帧视频
+    private static final int MAX_GOP_ANALYSIS_DURATION = 30 * 1000000; // 最多分析30秒
+
+    /**
+     * 检测是否为高B帧视频 - 优化版（无需读取数据）
+     */
+    private static boolean isHighBFrameVideo(String inputPath, int videoTrackIndex) {
+        MediaExtractor extractor = null;
+        try {
+            extractor = new MediaExtractor();
+            extractor.setDataSource(inputPath);
+            extractor.selectTrack(videoTrackIndex);
+
+            // 只分析前30秒或前500帧
+            int totalFrames = 0;
+            int bFrames = 0;
+            long analysisDuration = 30 * 1000000L; // 30秒
+
+            // 定位到开始
+            extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
+            while (totalFrames < 500) {
+                // 获取样本大小但不读取数据
+                long sampleTime = extractor.getSampleTime();
+                if (sampleTime > analysisDuration) {
+                    break;
+                }
+
+                int flags = extractor.getSampleFlags();
+                boolean isKeyframe = (flags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0;
+
+                totalFrames++;
+                if (!isKeyframe) {
+                    bFrames++;
+                }
+
+                // 前进到下一帧
+                if (!extractor.advance()) {
+                    break;
+                }
+            }
+
+            double bFrameRatio = totalFrames > 0 ? (double) bFrames / totalFrames : 0;
+            Log.d(TAG, String.format("B帧检测: 总帧数=%d, B帧数=%d, B帧比例=%.1f%%",
+                    totalFrames, bFrames, bFrameRatio * 100));
+
+            return bFrameRatio >= HIGH_BFRAME_THRESHOLD;
+
+        } catch (Exception e) {
+            Log.e(TAG, "检测B帧比例失败", e);
+            return false;
+        } finally {
+            if (extractor != null) {
+                extractor.release();
+            }
+        }
+    }
+
+    /**
+     * 简化的高B帧分割方案（基于你现有代码结构）
+     */
+    private static boolean splitVideoHighBFrames(String inputPath, String outputPath1,
+                                                 String outputPath2, long splitTimeUs,
+                                                 int videoTrackIndex, int audioTrackIndex,
+                                                 MediaFormat videoFormat, MediaFormat audioFormat,
+                                                 MainActivity.ProgressCallback callback) {
+
+        MediaExtractor extractor1 = null, extractor2 = null;
+        MediaMuxer muxer1 = null, muxer2 = null;
+
+        try {
+            updateStatus(callback, "使用高B帧优化方案...", 35);
+
+            // 创建两个独立的extractor
+            extractor1 = new MediaExtractor();
+            extractor1.setDataSource(inputPath);
+
+            extractor2 = new MediaExtractor();
+            extractor2.setDataSource(inputPath);
+
+            // 创建输出文件
+            muxer1 = new MediaMuxer(outputPath1, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            muxer2 = new MediaMuxer(outputPath2, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+
+            int muxer1VideoTrack = muxer1.addTrack(videoFormat);
+            int muxer1AudioTrack = audioFormat != null ? muxer1.addTrack(audioFormat) : -1;
+
+            int muxer2VideoTrack = muxer2.addTrack(videoFormat);
+            int muxer2AudioTrack = audioFormat != null ? muxer2.addTrack(audioFormat) : -1;
+
+            muxer1.start();
+            muxer2.start();
+
+            // 对于高B帧视频，使用更保守的分割策略
+            // 1. 确保分割点在一个完整的GOP边界
+            long adjustedSplitTime = adjustSplitForGOP(extractor1, videoTrackIndex, splitTimeUs);
+
+            Log.d(TAG, String.format("高B帧分割: 原分割点=%.3fs, 调整后=%.3fs",
+                    splitTimeUs/1000000.0, adjustedSplitTime/1000000.0));
+
+            // 2. 处理第一部分
+            updateStatus(callback, "处理第一部分（高B帧优化）...", 40);
+            boolean part1Success = copySegmentHighBFrames(extractor1,
+                    videoTrackIndex, audioTrackIndex,
+                    0, adjustedSplitTime,
+                    muxer1, muxer1VideoTrack, muxer1AudioTrack,
+                    callback, 40);
+
+            if (!part1Success) {
+                updateStatus(callback, "第一部分处理失败", 0);
+                return false;
+            }
+
+            // 3. 处理第二部分
+            updateStatus(callback, "处理第二部分（高B帧优化）...", 70);
+            boolean part2Success = copySegmentHighBFrames(extractor2,
+                    videoTrackIndex, audioTrackIndex,
+                    adjustedSplitTime, Long.MAX_VALUE,
+                    muxer2, muxer2VideoTrack, muxer2AudioTrack,
+                    callback, 70);
+
+            if (!part2Success) {
+                updateStatus(callback, "第二部分处理失败", 0);
+                return false;
+            }
+
+            muxer1.stop();
+            muxer2.stop();
+
+            updateStatus(callback, "高B帧优化分割完成", 95);
+            return true;
+
+        } catch (Exception e) {
+            updateStatus(callback, "高B帧分割失败: " + e.getMessage(), 0);
+            Log.e(TAG, "splitVideoHighBFrames error", e);
+            return false;
+        } finally {
+            try { if (muxer1 != null) muxer1.release(); } catch (Exception e) {}
+            try { if (muxer2 != null) muxer2.release(); } catch (Exception e) {}
+            try { if (extractor1 != null) extractor1.release(); } catch (Exception e) {}
+            try { if (extractor2 != null) extractor2.release(); } catch (Exception e) {}
+        }
+    }
+
+    /**
+     * 调整分割点以确保GOP完整
+     */
+    private static long adjustSplitForGOP(MediaExtractor extractor, int videoTrackIndex, long targetTimeUs) {
+        try {
+            extractor.selectTrack(videoTrackIndex);
+
+            // 向前查找关键帧
+            extractor.seekTo(targetTimeUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+            long prevKeyframe = extractor.getSampleTime();
+
+            // 向后查找关键帧
+            extractor.seekTo(targetTimeUs, MediaExtractor.SEEK_TO_NEXT_SYNC);
+            long nextKeyframe = extractor.getSampleTime();
+
+            // 选择离目标更近的关键帧
+            long prevDiff = Math.abs(targetTimeUs - prevKeyframe);
+            long nextDiff = Math.abs(nextKeyframe - targetTimeUs);
+
+            long selectedKeyframe = (prevDiff <= nextDiff) ? prevKeyframe : nextKeyframe;
+
+            // 对于高B帧视频，可能需要更保守的调整
+            // 检查这个关键帧之后的几帧，确保不是B帧密集区域
+            extractor.seekTo(selectedKeyframe, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
+            int bFrameCount = 0;
+            for (int i = 0; i < 5; i++) {
+                int flags = extractor.getSampleFlags();
+                boolean isKeyframe = (flags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0;
+
+                if (!isKeyframe) {
+                    bFrameCount++;
+                }
+
+                if (!extractor.advance()) {
+                    break;
+                }
+            }
+
+            // 如果关键帧后面紧跟很多B帧，可能不是好的分割点
+            if (bFrameCount >= 4) { // 5帧中有4帧是B帧
+                Log.d(TAG, "分割点处于B帧密集区域，尝试调整...");
+                // 尝试向前找一个更好的关键帧
+                extractor.seekTo(selectedKeyframe - 2000000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC); // 向前2秒
+                long alternativeKeyframe = extractor.getSampleTime();
+
+                if (selectedKeyframe - alternativeKeyframe < 5000000) { // 5秒内
+                    selectedKeyframe = alternativeKeyframe;
+                    Log.d(TAG, "调整到前一个关键帧: " + selectedKeyframe);
+                }
+            }
+
+            return selectedKeyframe;
+
+        } catch (Exception e) {
+            Log.e(TAG, "调整分割点失败", e);
+            return targetTimeUs;
+        }
+    }
+
+    /**
+     * 高B帧视频的片段复制（优化版本）- 修复样本大小不匹配问题
+     */
+    private static boolean copySegmentHighBFrames(MediaExtractor extractor,
+                                                  int videoTrackIndex, int audioTrackIndex,
+                                                  long startTimeUs, long endTimeUs,
+                                                  MediaMuxer muxer,
+                                                  int muxerVideoTrack, int muxerAudioTrack,
+                                                  MainActivity.ProgressCallback callback,
+                                                  int startProgress) {
+
+        try {
+            Log.d(TAG, "开始高B帧视频处理...");
+
+            // 使用一个足够大的缓冲区（16MB）
+            ByteBuffer buffer = ByteBuffer.allocate(16 * 1024 * 1024);
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+
+            // ========== 1. 处理视频轨道 ==========
+            extractor.selectTrack(videoTrackIndex);
+            extractor.seekTo(startTimeUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
+            long firstVideoPts = -1;
+            int videoFrames = 0;
+            long lastVideoPts = 0;
+            int skippedFrames = 0;
+
+            // 直接处理视频帧，不重新定位和重新读取
+            while (true) {
+                // 清空缓冲区
+                buffer.clear();
+
+                // 直接读取样本数据
+                int sampleSize = extractor.readSampleData(buffer, 0);
+                if (sampleSize < 0) break;
+
+                long pts = extractor.getSampleTime();
+                if (endTimeUs != Long.MAX_VALUE && pts >= endTimeUs) {
+                    Log.d(TAG, "达到结束时间，停止视频处理: " + pts);
+                    break;
+                }
+
+                if (firstVideoPts == -1) {
+                    firstVideoPts = pts;
+                    Log.d(TAG, "第一个视频PTS: " + pts + "us, 样本大小: " + sampleSize);
+                }
+
+                buffer.position(0);
+                buffer.limit(sampleSize);
+
+                long relativePts = pts - firstVideoPts;
+                if (relativePts < 0) {
+                    // 如果时间戳为负，跳过这一帧
+                    Log.w(TAG, "跳过负时间戳帧: " + pts);
+                    extractor.advance();
+                    skippedFrames++;
+                    continue;
+                }
+
+                info.set(0, sampleSize, relativePts,
+                        convertSampleFlagsToBufferFlags(extractor.getSampleFlags()));
+
+                try {
+                    muxer.writeSampleData(muxerVideoTrack, buffer, info);
+                    videoFrames++;
+                    lastVideoPts = relativePts;
+
+                    // 每100帧记录一次
+                    if (videoFrames % 100 == 0) {
+                        Log.d(TAG, String.format("已处理 %d 视频帧, 当前PTS: %.3fs",
+                                videoFrames, relativePts/1000000.0));
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "写入视频数据失败: " + e.getMessage(), e);
+                    break;
+                }
+
+                if (!extractor.advance()) {
+                    break;
+                }
+            }
+
+            Log.d(TAG, String.format("视频处理完成: %d帧, 跳过%d帧", videoFrames, skippedFrames));
+
+            // ========== 2. 处理音频轨道 ==========
+            int audioFrames = 0;
+            if (audioTrackIndex != -1 && muxerAudioTrack != -1) {
+                Log.d(TAG, "开始处理音频轨道...");
+
+                extractor.unselectTrack(videoTrackIndex);
+                extractor.selectTrack(audioTrackIndex);
+
+                // 音频应从视频起始时间开始
+                extractor.seekTo(firstVideoPts, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                long audioStartPts = extractor.getSampleTime();
+
+                Log.d(TAG, "音频起始PTS: " + audioStartPts + "us");
+
+                // 如果音频起始时间为负，调整
+                long audioOffset = 0;
+                if (audioStartPts < 0) {
+                    audioOffset = -audioStartPts;
+                    Log.d(TAG, "音频初始负偏移: " + audioOffset + "us");
+                }
+
+                long lastAudioPts = 0;
+                int skippedAudioFrames = 0;
+
+                while (true) {
+                    buffer.clear();
+                    int sampleSize = extractor.readSampleData(buffer, 0);
+                    if (sampleSize < 0) break;
+
+                    long pts = extractor.getSampleTime();
+                    if (endTimeUs != Long.MAX_VALUE && pts >= endTimeUs) {
+                        break;
+                    }
+
+                    buffer.position(0);
+                    buffer.limit(sampleSize);
+
+                    // 音频时间戳对齐视频
+                    long alignedPts = pts - firstVideoPts + audioOffset;
+                    if (alignedPts < 0) {
+                        // 跳过负时间戳的音频帧
+                        Log.w(TAG, "跳过负时间戳音频帧: " + pts);
+                        extractor.advance();
+                        skippedAudioFrames++;
+                        continue;
+                    }
+
+                    info.set(0, sampleSize, alignedPts,
+                            convertSampleFlagsToBufferFlags(extractor.getSampleFlags()));
+
+                    try {
+                        muxer.writeSampleData(muxerAudioTrack, buffer, info);
+                        audioFrames++;
+                        lastAudioPts = alignedPts;
+
+                        // 每200帧记录一次
+                        if (audioFrames % 200 == 0) {
+                            Log.d(TAG, String.format("已处理 %d 音频帧", audioFrames));
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "写入音频数据失败: " + e.getMessage(), e);
+                        break;
+                    }
+
+                    if (!extractor.advance()) {
+                        break;
+                    }
+                }
+
+                Log.d(TAG, String.format("音频处理完成: %d帧, 跳过%d帧",
+                        audioFrames, skippedAudioFrames));
+
+                // 恢复视频轨道选择
+                extractor.unselectTrack(audioTrackIndex);
+                extractor.selectTrack(videoTrackIndex);
+            }
+
+            if (callback != null) {
+                callback.onProgressUpdate(
+                        String.format("完成: %d视频帧, %d音频帧", videoFrames, audioFrames),
+                        100);
+            }
+
+            return videoFrames > 0;
+
+        } catch (Exception e) {
+            Log.e(TAG, "copySegmentHighBFrames error", e);
+            return false;
+        }
+    }
+
+    /**
+     * 写入一个GOP的所有帧（按显示顺序）
+     */
+    private static void writeGOPFrames(List<VideoFrame> gopFrames, MediaMuxer muxer,
+                                       int videoTrack, long videoBaseTime) {
+
+        if (gopFrames.isEmpty()) return;
+
+        // 按PTS排序（显示顺序）
+        Collections.sort(gopFrames, (f1, f2) -> Long.compare(f1.pts, f2.pts));
+
+        ByteBuffer buffer = ByteBuffer.allocate(8 * 1024 * 1024);
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+
+        for (VideoFrame frame : gopFrames) {
+            long relativePts = frame.pts - videoBaseTime;
+            if (relativePts < 0) relativePts = 0;
+
+            buffer.clear();
+            buffer.put(frame.data);
+            buffer.position(0);
+            buffer.limit(frame.size);
+
+            info.set(0, frame.size, relativePts,
+                    convertSampleFlagsToBufferFlags(frame.flags));
+
+            muxer.writeSampleData(videoTrack, buffer, info);
+        }
+    }
+
+    /**
+     * 视频帧数据结构
+     */
+    static class VideoFrame {
+        long pts;
+        int size;
+        int flags;
+        byte[] data;
+    }
+
     /**
      * 优化分割视频（快速+精确）
      */
@@ -322,7 +741,7 @@ public class VideoEditor {
                 }
             }
 
-            // 确保分割时间在有效范围内（至少保留1秒，最多到duration-1秒）
+            // 确保分割时间在有效范围内
             if (splitTimeUs <= 1000000) {
                 splitTimeUs = 1000000;
                 updateStatus(callback, "分割时间调整到1秒", 10);
@@ -334,8 +753,20 @@ public class VideoEditor {
             Log.d(TAG, String.format("分割参数: 总时长=%.3fs, 分割点=%.3fs",
                     duration/1000000.0, splitTimeUs/1000000.0));
 
-            // 2. 查找分割点附近的关键帧
-            updateStatus(callback, "查找最佳分割点...", 15);
+            // 2. 检测是否为高B帧视频
+            updateStatus(callback, "检测视频编码特征...", 15);
+            boolean isHighBFrameVideo = isHighBFrameVideo(inputPath, videoTrackIndex);
+
+            if (isHighBFrameVideo) {
+                Log.d(TAG, "检测到高B帧视频，使用优化方案");
+                updateStatus(callback, "检测到高B帧视频，使用优化方案", 20);
+            } else {
+                Log.d(TAG, "常规视频，使用快速分割");
+                updateStatus(callback, "常规视频，使用快速分割", 20);
+            }
+
+            // 3. 查找分割点附近的关键帧
+            updateStatus(callback, "查找最佳分割点...", 25);
             long actualSplitTimeUs = findNearestKeyframe(extractor, videoTrackIndex, splitTimeUs);
 
             // 记录实际分割点和目标分割点的差异
@@ -345,11 +776,18 @@ public class VideoEditor {
                     actualSplitTimeUs / 1000000.0,
                     diff / 1000000.0));
 
-            // 总是使用快速复制方法（简化逻辑，避免转码的复杂性）
-            updateStatus(callback, "执行快速分割...", 20);
-            return splitVideoFastCopy(inputPath, outputPath1, outputPath2,
-                    actualSplitTimeUs, videoTrackIndex, audioTrackIndex,
-                    videoFormat, audioFormat, callback);
+            // 4. 根据视频类型选择分割方案
+            if (isHighBFrameVideo) {
+                // 使用高B帧优化方案
+                return splitVideoHighBFrames(inputPath, outputPath1, outputPath2,
+                        actualSplitTimeUs, videoTrackIndex, audioTrackIndex,
+                        videoFormat, audioFormat, callback);
+            } else {
+                // 使用原来的快速复制方法
+                return splitVideoFastCopy(inputPath, outputPath1, outputPath2,
+                        actualSplitTimeUs, videoTrackIndex, audioTrackIndex,
+                        videoFormat, audioFormat, callback);
+            }
 
         } catch (Exception e) {
             updateStatus(callback, "分割出错：" + e.getMessage(), 0);
@@ -366,20 +804,27 @@ public class VideoEditor {
         }
     }
 
-    /**
-     * 查找最近的关键帧
-     */
     private static long findNearestKeyframe(MediaExtractor extractor, int videoTrackIndex, long targetTimeUs) {
         try {
             extractor.selectTrack(videoTrackIndex);
+
+            // 保存当前状态
+            long currentPosition = extractor.getSampleTime();
+            int currentFlags = extractor.getSampleFlags();
 
             // 向前查找关键帧
             extractor.seekTo(targetTimeUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
             long prevKeyframeTime = extractor.getSampleTime();
 
+            // 恢复状态
+            extractor.seekTo(currentPosition, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
             // 向后查找关键帧
             extractor.seekTo(targetTimeUs, MediaExtractor.SEEK_TO_NEXT_SYNC);
             long nextKeyframeTime = extractor.getSampleTime();
+
+            // 恢复到原始位置
+            extractor.seekTo(currentPosition, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
 
             // 选择更近的关键帧
             long prevDiff = Math.abs(targetTimeUs - prevKeyframeTime);
@@ -403,20 +848,20 @@ public class VideoEditor {
         try {
             updateStatus(callback, "准备分割视频...", 30);
 
-            // 创建两个独立的extractor来处理两个部分
+            // 创建两个独立的extractor
             extractor1 = new MediaExtractor();
             extractor1.setDataSource(inputPath);
 
             extractor2 = new MediaExtractor();
             extractor2.setDataSource(inputPath);
 
-            // 创建第一个输出文件（前半部分）
+            // 创建输出文件
             muxer1 = new MediaMuxer(outputPath1, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            muxer2 = new MediaMuxer(outputPath2, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+
             int muxer1VideoTrack = muxer1.addTrack(videoFormat);
             int muxer1AudioTrack = audioFormat != null ? muxer1.addTrack(audioFormat) : -1;
 
-            // 创建第二个输出文件（后半部分）
-            muxer2 = new MediaMuxer(outputPath2, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
             int muxer2VideoTrack = muxer2.addTrack(videoFormat);
             int muxer2AudioTrack = audioFormat != null ? muxer2.addTrack(audioFormat) : -1;
 
@@ -426,8 +871,13 @@ public class VideoEditor {
 
             // 处理第一部分（0 到 splitTimeUs）
             updateStatus(callback, "处理第一部分...", 40);
-            boolean part1Success = copySegmentToMuxer(extractor1, videoTrackIndex, audioTrackIndex,
-                    0, splitTimeUs, muxer1, muxer1VideoTrack, muxer1AudioTrack, callback, 40, 25);
+
+            // 使用改进的copy方法（你可以选择使用原来的或新的）
+            boolean part1Success = copySegmentToMuxerImproved(extractor1,
+                    videoTrackIndex, audioTrackIndex,
+                    0, splitTimeUs,
+                    muxer1, muxer1VideoTrack, muxer1AudioTrack,
+                    callback, 40);
 
             if (!part1Success) {
                 updateStatus(callback, "第一部分处理失败", 0);
@@ -436,8 +886,12 @@ public class VideoEditor {
 
             // 处理第二部分（splitTimeUs 到结束）
             updateStatus(callback, "处理第二部分...", 65);
-            boolean part2Success = copySegmentToMuxer(extractor2, videoTrackIndex, audioTrackIndex,
-                    splitTimeUs, Long.MAX_VALUE, muxer2, muxer2VideoTrack, muxer2AudioTrack, callback, 65, 25);
+
+            boolean part2Success = copySegmentToMuxerImproved(extractor2,
+                    videoTrackIndex, audioTrackIndex,
+                    splitTimeUs, Long.MAX_VALUE,
+                    muxer2, muxer2VideoTrack, muxer2AudioTrack,
+                    callback, 65);
 
             if (!part2Success) {
                 updateStatus(callback, "第二部分处理失败", 0);
@@ -479,11 +933,16 @@ public class VideoEditor {
         }
     }
 
-    private static boolean copySegmentToMuxer(MediaExtractor extractor, int videoTrackIndex, int audioTrackIndex,
-                                              long startTimeUs, long endTimeUs, MediaMuxer muxer,
-                                              int muxerVideoTrack, int muxerAudioTrack,
-                                              MainActivity.ProgressCallback callback,
-                                              int startProgress, int progressRange) {
+    /**
+     * 改进的视频片段复制方法（常规视频用）
+     */
+    private static boolean copySegmentToMuxerImproved(MediaExtractor extractor,
+                                                      int videoTrackIndex, int audioTrackIndex,
+                                                      long startTimeUs, long endTimeUs,
+                                                      MediaMuxer muxer,
+                                                      int muxerVideoTrack, int muxerAudioTrack,
+                                                      MainActivity.ProgressCallback callback,
+                                                      int startProgress) {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(1024 * 1024);
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
@@ -507,20 +966,24 @@ public class VideoEditor {
                 buffer.position(0);
                 buffer.limit(sampleSize);
 
-                info.set(0, sampleSize, pts - firstPts, extractor.getSampleFlags());
+                // 使用原始PTS，不重新计算时间戳
+                long relativePts = pts - firstPts;
+
+                info.set(0, sampleSize, relativePts, extractor.getSampleFlags());
                 muxer.writeSampleData(muxerVideoTrack, buffer, info);
 
                 videoFrames++;
                 extractor.advance();
 
                 // 更新进度
-                if (videoFrames % 30 == 0) {
+                if (videoFrames % 30 == 0 && callback != null) {
                     long processed = pts - startTimeUs;
-                    long total = Math.min(endTimeUs - startTimeUs, extractor.getTrackFormat(videoTrackIndex)
-                            .getLong(MediaFormat.KEY_DURATION) - startTimeUs);
+                    long total = Math.min(endTimeUs - startTimeUs,
+                            extractor.getTrackFormat(videoTrackIndex)
+                                    .getLong(MediaFormat.KEY_DURATION) - startTimeUs);
 
                     if (total > 0) {
-                        int progress = startProgress + (int)((processed * progressRange) / total);
+                        int progress = startProgress + (int)((processed * 25) / total);
                         updateStatus(callback, String.format("已处理 %d 视频帧", videoFrames), progress);
                     }
                 }
@@ -555,7 +1018,8 @@ public class VideoEditor {
                     buffer.position(0);
                     buffer.limit(sampleSize);
 
-                    info.set(0, sampleSize, pts - audioFirstPts, extractor.getSampleFlags());
+                    long relativePts = pts - audioFirstPts;
+                    info.set(0, sampleSize, relativePts, extractor.getSampleFlags());
                     muxer.writeSampleData(muxerAudioTrack, buffer, info);
 
                     audioFrames++;
@@ -568,7 +1032,249 @@ public class VideoEditor {
             return true;
 
         } catch (Exception e) {
-            Log.e(TAG, "copySegmentToMuxer error", e);
+            Log.e(TAG, "copySegmentToMuxerImproved error", e);
+            return false;
+        }
+    }
+
+    /**
+     * 终极修复：保持容器时间戳和GOP完整性，解决流畅度问题
+     */
+    private static boolean copySegmentToMuxer(MediaExtractor extractor,
+                                              int videoTrackIndex, int audioTrackIndex,
+                                              long startTimeUs, long endTimeUs,
+                                              MediaMuxer muxer,
+                                              int muxerVideoTrack, int muxerAudioTrack,
+                                              MainActivity.ProgressCallback callback,
+                                              int startProgress) {
+
+        try {
+            ByteBuffer buffer = ByteBuffer.allocate(8 * 1024 * 1024);
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+
+            Log.d(TAG, String.format("开始复制片段: [%.3fs - %.3fs]",
+                    startTimeUs/1000000.0,
+                    endTimeUs == Long.MAX_VALUE ? Double.MAX_VALUE : endTimeUs/1000000.0));
+
+            // =============== 1. 获取原始格式和关键信息 ===============
+            extractor.selectTrack(videoTrackIndex);
+            MediaFormat videoFormat = extractor.getTrackFormat(videoTrackIndex);
+
+            // 提取关键参数
+            String mime = videoFormat.getString(MediaFormat.KEY_MIME);
+            int width = videoFormat.getInteger(MediaFormat.KEY_WIDTH);
+            int height = videoFormat.getInteger(MediaFormat.KEY_HEIGHT);
+            int frameRate = videoFormat.containsKey(MediaFormat.KEY_FRAME_RATE) ?
+                    videoFormat.getInteger(MediaFormat.KEY_FRAME_RATE) : 30;
+
+            Log.d(TAG, String.format("视频格式: %s, %dx%d, %dfps",
+                    mime, width, height, frameRate));
+
+            // =============== 2. 关键修复：查找第一个I帧的精确时间 ===============
+            extractor.seekTo(startTimeUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+            long firstKeyframePts = extractor.getSampleTime();
+            int firstKeyframeFlags = extractor.getSampleFlags();
+            boolean isFirstKeyframe = (firstKeyframeFlags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0;
+
+            Log.d(TAG, String.format("第一个关键帧: PTS=%.3fs, 是关键帧=%s",
+                    firstKeyframePts/1000000.0, isFirstKeyframe));
+
+            // 如果不是关键帧，向前查找最近的关键帧
+            if (!isFirstKeyframe) {
+                extractor.seekTo(startTimeUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+                firstKeyframePts = extractor.getSampleTime();
+                Log.d(TAG, String.format("调整到前一个关键帧: PTS=%.3fs",
+                        firstKeyframePts/1000000.0));
+            }
+
+            // =============== 3. 处理视频轨道（保持容器时间戳） ===============
+            // 重新定位到关键帧
+            extractor.seekTo(firstKeyframePts, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
+            // 关键：保持原始PTS，不重新计算时间戳
+            long containerTimeOffset = firstKeyframePts; // 容器层时间偏移
+            int videoFrames = 0;
+            long lastVideoPts = 0;
+            long maxVideoPts = 0;
+
+            // 预扫描：检查分割点后的B帧是否依赖前面的帧
+            List<Long> bFramePtsList = new ArrayList<>();
+            List<Long> pFramePtsList = new ArrayList<>();
+
+            while (true) {
+                int sampleSize = extractor.readSampleData(buffer, 0);
+                if (sampleSize < 0) break;
+
+                long pts = extractor.getSampleTime();
+
+                // 检查是否到达结束时间
+                if (endTimeUs != Long.MAX_VALUE && pts >= endTimeUs) {
+                    Log.d(TAG, "达到结束时间，停止视频处理: " + pts);
+                    break;
+                }
+
+                int sampleFlags = extractor.getSampleFlags();
+                boolean isKeyframe = (sampleFlags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0;
+
+                // 分类记录帧类型
+                if (!isKeyframe) {
+                    bFramePtsList.add(pts);
+                } else {
+                    pFramePtsList.add(pts);
+                }
+
+                // 计算相对时间戳（但保持容器时间戳特性）
+                long relativePts = pts - containerTimeOffset;
+
+                buffer.position(0);
+                buffer.limit(sampleSize);
+
+                // 关键修复：使用原始PTS，不调整B帧时序
+                info.set(0, sampleSize, pts, // 使用原始PTS，不是relativePts！
+                        convertSampleFlagsToBufferFlags(sampleFlags));
+
+                muxer.writeSampleData(muxerVideoTrack, buffer, info);
+
+                videoFrames++;
+                lastVideoPts = pts;
+                maxVideoPts = Math.max(maxVideoPts, pts);
+
+                extractor.advance();
+
+                // 更新进度
+                if (videoFrames % 30 == 0 && callback != null) {
+                    long duration = endTimeUs - startTimeUs;
+                    if (duration > 0 && duration != Long.MAX_VALUE) {
+                        int progress = startProgress +
+                                (int)((pts * (95 - startProgress)) / duration);
+                        progress = Math.min(progress, 95);
+
+                        String status = String.format("视频: %d帧, 原始PTS=%.3fs",
+                                videoFrames, pts/1000000.0);
+                        callback.onProgressUpdate(status, progress);
+                    }
+                }
+
+                if (videoFrames > 10000) break;
+            }
+
+            Log.d(TAG, String.format("视频处理完成: %d帧, I/P帧:%d, B帧:%d, 最大PTS:%.3fs",
+                    videoFrames, pFramePtsList.size(), bFramePtsList.size(),
+                    maxVideoPts/1000000.0));
+
+            // =============== 4. 修复音频处理（保持负偏移） ===============
+            int audioFrames = 0;
+            if (audioTrackIndex != -1 && muxerAudioTrack != -1) {
+                Log.d(TAG, "处理音频轨道（保持原始时间戳）...");
+
+                // 切换到音频轨道
+                extractor.unselectTrack(videoTrackIndex);
+                extractor.selectTrack(audioTrackIndex);
+
+                // 关键修复：音频使用相同的容器时间偏移
+                // 查找第一个音频样本（不调整时间戳）
+                extractor.seekTo(firstKeyframePts, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                long firstAudioPts = extractor.getSampleTime();
+
+                // 重要：记录音频的原始负偏移
+                long audioInitialOffset = 0;
+                if (firstAudioPts < 0) {
+                    audioInitialOffset = -firstAudioPts;
+                    Log.d(TAG, String.format("音频初始负偏移: -%.3fs",
+                            audioInitialOffset/1000000.0));
+
+                    // 修正：跳过负时间戳的音频样本
+                    while (firstAudioPts < 0 && extractor.advance()) {
+                        firstAudioPts = extractor.getSampleTime();
+                    }
+
+                    if (firstAudioPts < 0) {
+                        Log.w(TAG, "所有音频样本均为负时间戳，从0开始");
+                        extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                        firstAudioPts = extractor.getSampleTime();
+                    }
+                }
+
+                Log.d(TAG, String.format("音频起始PTS: %.3fs", firstAudioPts/1000000.0));
+
+                long lastAudioPts = 0;
+
+                while (true) {
+                    int sampleSize = extractor.readSampleData(buffer, 0);
+                    if (sampleSize < 0) break;
+
+                    long pts = extractor.getSampleTime();
+
+                    // 检查是否到达结束时间
+                    if (endTimeUs != Long.MAX_VALUE && pts >= endTimeUs) {
+                        break;
+                    }
+
+                    // 确保音频与视频时间范围匹配
+                    if (maxVideoPts > 0 && pts > maxVideoPts + 2000000) {
+                        Log.d(TAG, "音频超过视频范围，停止处理");
+                        break;
+                    }
+
+                    buffer.position(0);
+                    buffer.limit(sampleSize);
+
+                    // 关键修复：音频使用原始PTS + 初始偏移修正
+                    long correctedAudioPts = pts + audioInitialOffset;
+
+                    info.set(0, sampleSize, correctedAudioPts,
+                            convertSampleFlagsToBufferFlags(extractor.getSampleFlags()));
+
+                    muxer.writeSampleData(muxerAudioTrack, buffer, info);
+
+                    audioFrames++;
+                    lastAudioPts = correctedAudioPts;
+                    extractor.advance();
+
+                    if (audioFrames % 200 == 0) {
+                        Log.v(TAG, String.format("音频帧 %d, PTS=%.3fs",
+                                audioFrames, correctedAudioPts/1000000.0));
+                    }
+
+                    if (audioFrames > 20000) break;
+                }
+
+                Log.d(TAG, String.format("音频处理完成: %d帧, 最后PTS=%.3fs",
+                        audioFrames, lastAudioPts/1000000.0));
+
+                // 恢复视频轨道
+                extractor.unselectTrack(audioTrackIndex);
+                extractor.selectTrack(videoTrackIndex);
+            }
+
+            // =============== 5. 验证和日志 ===============
+            Log.d(TAG, String.format("片段复制完成: 视频%d帧(最大PTS=%.3fs), 音频%d帧",
+                    videoFrames, maxVideoPts/1000000.0, audioFrames));
+
+            // 检查音视频PTS范围
+            if (audioFrames > 0) {
+                double videoDuration = (maxVideoPts - firstKeyframePts) / 1000000.0;
+                double expectedAudioDuration = videoDuration;
+
+                Log.d(TAG, String.format("时间范围检查: 视频%.3fs, 期望音频%.3fs",
+                        videoDuration, expectedAudioDuration));
+            }
+
+            if (callback != null) {
+                callback.onProgressUpdate(
+                        String.format("完成: %d视频帧, %d音频帧", videoFrames, audioFrames),
+                        100);
+            }
+
+            return videoFrames > 0;
+
+        } catch (Exception e) {
+            Log.e(TAG, "copySegmentToMuxer 发生异常", e);
+
+            if (callback != null) {
+                callback.onProgressUpdate("处理失败: " + e.getMessage(), 0);
+            }
+
             return false;
         }
     }
@@ -642,7 +1348,6 @@ public class VideoEditor {
 
                 // 每复制5MB更新一次进度
                 if (totalRead % (5 * 1024 * 1024) == 0 && fileSize > 0) {
-                    int progress = (int) ((totalRead * 100.0) / fileSize);
                     updateStatus(callback, String.format("复制文件: %.1fMB/%.1fMB",
                             totalRead/(1024.0*1024.0), fileSize/(1024.0*1024.0)), -1);
                 }
@@ -672,70 +1377,6 @@ public class VideoEditor {
                 if (fos != null) fos.close();
             } catch (Exception e) {}
         }
-    }
-
-    /**
-     * 局部转码分割（只在分割点附近转码）
-     */
-    private static boolean splitVideoWithPartialTranscode(String inputPath, String outputPath1, String outputPath2,
-                                                          long targetSplitTimeUs, long actualSplitTimeUs,
-                                                          int videoTrackIndex, int audioTrackIndex,
-                                                          MediaFormat videoFormat, MediaFormat audioFormat,
-                                                          long totalDuration,
-                                                          MainActivity.ProgressCallback callback) {
-        // 这个方法在分割点离关键帧太远时使用
-        // 只在分割点附近的小范围内转码，其他部分直接复制
-
-        // 定义转码范围（例如分割点前后5秒）
-        long transcodeRangeUs = 5000000; // 5秒
-
-        // 第一部分：0到（targetSplitTimeUs - 2.5秒）直接复制
-        // 然后从（targetSplitTimeUs - 2.5秒）到targetSplitTimeUs转码
-
-        // 第二部分：从targetSplitTimeUs到（targetSplitTimeUs + 2.5秒）转码
-        // 然后从（targetSplitTimeUs + 2.5秒）到结束直接复制
-
-        // 由于实现较复杂，这里提供一个简化的全转码版本
-        // 实际应用中，你可以根据这个思路实现混合方案
-
-        updateStatus(callback, "执行精确转码分割...", 30);
-
-        // 调用原来的转码方法（作为备选）
-        return splitVideoPrecise(inputPath, outputPath1, outputPath2, targetSplitTimeUs,
-                videoFormat, totalDuration, callback);
-    }
-
-    /**
-     * 精确分割（全转码）
-     */
-    private static boolean splitVideoPrecise(String inputPath, String outputPath1, String outputPath2,
-                                             long splitTimeUs, MediaFormat videoFormat, long totalDuration,
-                                             MainActivity.ProgressCallback callback) {
-        // 调用你原来的splitVideo方法，但这里重新组织以重用代码
-        // 创建进度回调
-        MainActivity.ProgressCallback part1Callback = (status, progress) -> {
-            int mappedProgress = 30 + (progress * 30) / 100;
-            updateStatus(callback, "第一部分：" + status, mappedProgress);
-        };
-
-        MainActivity.ProgressCallback part2Callback = (status, progress) -> {
-            int mappedProgress = 60 + (progress * 30) / 100;
-            updateStatus(callback, "第二部分：" + status, mappedProgress);
-        };
-
-        // 执行转码
-        boolean part1Success = transcodeVideoSegmentOptimized(inputPath, outputPath1,
-                0, splitTimeUs, videoFormat, part1Callback);
-
-        if (!part1Success) {
-            return false;
-        }
-
-        boolean part2Success = transcodeVideoSegmentOptimized(inputPath, outputPath2,
-                splitTimeUs, totalDuration, videoFormat, part2Callback);
-
-        updateStatus(callback, "精确分割完成！", 100);
-        return part1Success && part2Success;
     }
 
     /**
@@ -1477,14 +2118,12 @@ public class VideoEditor {
             firstExtractor.setDataSource(inputPaths[0]);
 
             MediaFormat videoFormat = null, audioFormat = null;
-            int videoTrackIndex = -1, audioTrackIndex = -1;
 
             for (int i = 0; i < firstExtractor.getTrackCount(); i++) {
                 MediaFormat format = firstExtractor.getTrackFormat(i);
                 String mime = format.getString(MediaFormat.KEY_MIME);
                 if (mime.startsWith("video/") && videoFormat == null) {
                     videoFormat = format;
-                    videoTrackIndex = i;
                     Log.d(TAG, String.format("视频格式: %dx%d, 帧率: %d, 码率: %d",
                             format.getInteger(MediaFormat.KEY_WIDTH),
                             format.getInteger(MediaFormat.KEY_HEIGHT),
@@ -1492,7 +2131,6 @@ public class VideoEditor {
                             format.getInteger(MediaFormat.KEY_BIT_RATE)));
                 } else if (mime.startsWith("audio/") && audioFormat == null) {
                     audioFormat = format;
-                    audioTrackIndex = i;
                     Log.d(TAG, "音频格式: " + format);
                 }
             }

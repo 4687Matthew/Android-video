@@ -383,32 +383,61 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
-            // 生成输出文件名
-            File inputFile = new File(selectedVideoPath);
-            String baseName = inputFile.getName();
-            int dot = baseName.lastIndexOf('.');
-            String ext = dot >= 0 ? baseName.substring(dot) : ".mp4";
-            String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
-            String fileName = pureName + "_cropped_" +
-                    String.format(Locale.US, "%.1f-%.1f", startTime, endTime) + ext;
-
-            String outPath;
+            // 获取视频总时长
+            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+            double totalDuration = 0;
             try {
-                outPath = createPublicVideoFile(fileName);
-                File outFile = new File(outPath);
-                File parentDir = outFile.getParentFile();
-                if (!parentDir.exists()) {
-                    parentDir.mkdirs();
+                retriever.setDataSource(selectedVideoPath);
+                String durationStr = retriever.extractMetadata(
+                        MediaMetadataRetriever.METADATA_KEY_DURATION);
+                if (durationStr != null) {
+                    totalDuration = Long.parseLong(durationStr) / 1000.0;
+
+                    // 验证裁剪时间
+                    if (startTime < 0) startTime = 0;
+                    if (endTime > totalDuration) endTime = totalDuration;
+
+                    if (endTime - startTime < 1.0) {
+                        showToast("裁剪时长不能小于1秒");
+                        return;
+                    }
+
+                    tvStatus.setText(String.format("视频总时长: %.1f秒，将裁剪 %.1f-%.1f秒",
+                            totalDuration, startTime, endTime));
+                } else {
+                    showToast("无法获取视频时长");
+                    return;
                 }
-            } catch (IOException e) {
-                showToast("创建输出文件失败: " + e.getMessage());
+            } finally {
+                retriever.release();
+            }
+
+            // 使用应用私有目录
+            File outputDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+            if (outputDir == null) {
+                showToast("无法创建输出目录");
                 return;
             }
 
-            // 显示进度条和状态
+            String baseName = new File(selectedVideoPath).getName();
+            int dot = baseName.lastIndexOf('.');
+            String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
+            String ext = dot >= 0 ? baseName.substring(dot) : ".mp4";
+
+            String outputPath = new File(outputDir,
+                    pureName + "_cropped_" +
+                            String.format(Locale.US, "%.1f-%.1f", startTime, endTime) +
+                            ext).getAbsolutePath();
+
+            // 确保输出文件不存在
+            new File(outputPath).delete();
+
+            Log.d(TAG, "输出路径: " + outputPath);
+
+            // 显示进度
             showProgress(true);
             progressBar.setProgress(0);
-            tvStatus.setText("准备裁剪视频...");
+            tvStatus.setText("开始裁剪视频...");
 
             // 创建进度回调
             ProgressCallback progressCallback = (status, progress) -> runOnUiThread(() -> {
@@ -421,48 +450,38 @@ public class MainActivity extends AppCompatActivity {
             });
 
             // 在新线程中执行裁剪
+            double finalStartTime = startTime;
+            double finalEndTime = endTime;
             new Thread(() -> {
                 boolean success = VideoEditor.cropVideo(
-                        selectedVideoPath, outPath,
-                        (long)(startTime * 1000000),
-                        (long)(endTime * 1000000),
+                        selectedVideoPath, outputPath,
+                        (long)(finalStartTime * 1000000),
+                        (long)(finalEndTime * 1000000),
                         progressCallback);
 
                 runOnUiThread(() -> {
                     showProgress(false);
                     if (success) {
-                        File outputFile = new File(outPath);
-                        if (outputFile.exists() && outputFile.length() > 0) {
-                            // 计算原始和裁剪后的文件大小
-                            File input = new File(selectedVideoPath);
-                            long originalSize = input.length();
-                            long croppedSize = outputFile.length();
-                            double duration = (endTime - startTime);
+                        File croppedFile = new File(outputPath);
 
-                            // 添加到媒体库
-                            scanMediaFile(outPath);
+                        if (croppedFile.exists() && croppedFile.length() > 0) {
+                            // 将文件保存到公共目录并扫描到媒体库
+                            saveToPublicAndScan(croppedFile,
+                                    pureName + "_cropped_" +
+                                            String.format(Locale.US, "%.1f-%.1f", finalStartTime, finalEndTime) +
+                                            ext);
 
-                            // 显示结果信息
-                            try {
-                                tvStatus.setText(String.format(
-                                        "裁剪完成！\n" +
-                                                "时长: %.1f秒 → %.1f秒\n" +
-                                                "大小: %.1fMB → %.1fMB\n" +
-                                                "保存位置: %s",
-                                        getVideoDuration(selectedVideoPath),
-                                        duration,
-                                        originalSize/(1024.0*1024.0),
-                                        croppedSize/(1024.0*1024.0),
-                                        outputFile.getName()));
-                            } catch (IOException e) {
-                                throw new RuntimeException(e);
-                            }
-
+                            tvStatus.setText(String.format(
+                                    "裁剪完成！\n" +
+                                            "大小: %.1fMB\n" +
+                                            "时长: %.1f秒",
+                                    croppedFile.length()/(1024.0*1024.0),
+                                    (finalEndTime - finalStartTime)));
                             progressBar.setProgress(100);
-                            showToast("裁剪完成，已保存到相册");
+                            showToast("裁剪完成！");
                         } else {
-                            tvStatus.setText("裁剪失败：输出文件为空");
-                            showToast("裁剪失败：输出文件为空");
+                            tvStatus.setText("裁剪失败：输出文件不存在");
+                            showToast("裁剪失败：输出文件不存在");
                         }
                     } else {
                         tvStatus.setText("裁剪失败");
@@ -473,28 +492,10 @@ public class MainActivity extends AppCompatActivity {
 
         } catch (NumberFormatException e) {
             showToast("请输入有效的时间数字");
-        }
-    }
-
-    /**
-     * 获取视频时长（秒）
-     */
-    private double getVideoDuration(String path) throws IOException {
-        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-        try {
-            retriever.setDataSource(path);
-            String durationStr = retriever.extractMetadata(
-                    MediaMetadataRetriever.METADATA_KEY_DURATION);
-            if (durationStr != null) {
-                long durationMs = Long.parseLong(durationStr);
-                return durationMs / 1000.0;
-            }
         } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            retriever.release();
+            showToast("裁剪出错: " + e.getMessage());
+            Log.e(TAG, "裁剪视频异常", e);
         }
-        return 0;
     }
 
     private void splitVideo() {
