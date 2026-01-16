@@ -1,17 +1,21 @@
 package org.video;
 
+import static androidx.constraintlayout.helper.widget.MotionEffect.TAG;
+
 import android.Manifest;
 import android.app.Activity;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.media.MediaMetadataRetriever;
+import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.util.Log;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
@@ -508,52 +512,61 @@ public class MainActivity extends AppCompatActivity {
         try {
             double splitTime = Double.parseDouble(splitTimeStr);
 
-            // 获取视频总时长，验证分割时间是否合理
+            // 获取视频总时长
             MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+            double totalDuration = 0;
             try {
                 retriever.setDataSource(selectedVideoPath);
                 String durationStr = retriever.extractMetadata(
                         MediaMetadataRetriever.METADATA_KEY_DURATION);
                 if (durationStr != null) {
-                    long durationMs = Long.parseLong(durationStr);
-                    double totalDuration = durationMs / 1000.0;
+                    totalDuration = Long.parseLong(durationStr) / 1000.0;
 
-                    if (splitTime <= 1.0 || splitTime >= totalDuration - 1.0) {
-                        showToast(String.format("分割点必须距离开始和结束至少1秒（总时长: %.1f秒）", totalDuration));
+                    // 验证分割时间
+                    if (splitTime < 1.0) {
+                        showToast("分割时间不能小于1秒");
+                        return;
+                    }
+                    if (splitTime > totalDuration - 1.0) {
+                        showToast(String.format("分割时间不能超过%.1f秒", totalDuration - 1.0));
                         return;
                     }
 
-                    // 显示时长信息
-                    tvStatus.setText(String.format("视频总时长: %.1f秒，将精确分割为 %.1f秒 和 %.1f秒",
-                            totalDuration, splitTime, totalDuration - splitTime));
+                    tvStatus.setText(String.format("视频总时长: %.1f秒，将在 %.1f秒 处分割",
+                            totalDuration, splitTime));
+                } else {
+                    showToast("无法获取视频时长");
+                    return;
                 }
             } finally {
                 retriever.release();
             }
 
-            // 生成输出文件名
-            File inputFile = new File(selectedVideoPath);
-            String baseName = inputFile.getName();
-            int dot = baseName.lastIndexOf('.');
-            String ext = dot >= 0 ? baseName.substring(dot) : ".mp4";
-            String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
-
-            String fileName1 = pureName + "_part1_precise" + ext;
-            String fileName2 = pureName + "_part2_precise" + ext;
-
-            String outputPath1, outputPath2;
-            try {
-                outputPath1 = createPublicVideoFile(fileName1);
-                outputPath2 = createPublicVideoFile(fileName2);
-            } catch (IOException e) {
-                showToast("创建输出文件失败: " + e.getMessage());
+            // 使用应用私有目录避免权限问题
+            File outputDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+            if (outputDir == null) {
+                showToast("无法创建输出目录");
                 return;
             }
 
-            // 显示进度条和状态
+            String baseName = new File(selectedVideoPath).getName();
+            int dot = baseName.lastIndexOf('.');
+            String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
+
+            String outputPath1 = new File(outputDir, pureName + "_part1.mp4").getAbsolutePath();
+            String outputPath2 = new File(outputDir, pureName + "_part2.mp4").getAbsolutePath();
+
+            // 确保输出文件不存在
+            new File(outputPath1).delete();
+            new File(outputPath2).delete();
+
+            Log.d(TAG, "输出路径1: " + outputPath1);
+            Log.d(TAG, "输出路径2: " + outputPath2);
+
+            // 显示进度
             showProgress(true);
             progressBar.setProgress(0);
-            tvStatus.setText("开始精确分割...");
+            tvStatus.setText("开始分割视频...");
 
             // 创建进度回调
             ProgressCallback progressCallback = (status, progress) -> runOnUiThread(() -> {
@@ -565,7 +578,7 @@ public class MainActivity extends AppCompatActivity {
                 }
             });
 
-            // 在新线程中执行精确分割
+            // 在新线程中执行分割
             new Thread(() -> {
                 boolean success = VideoEditor.splitVideoOptimized(
                         selectedVideoPath, outputPath1, outputPath2,
@@ -574,50 +587,29 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     showProgress(false);
                     if (success) {
-                        File outputFile1 = new File(outputPath1);
-                        File outputFile2 = new File(outputPath2);
+                        File part1 = new File(outputPath1);
+                        File part2 = new File(outputPath2);
 
-                        if (outputFile1.exists() && outputFile1.length() > 0 &&
-                                outputFile2.exists() && outputFile2.length() > 0) {
+                        if (part1.exists() && part2.exists()) {
+                            // 将文件保存到公共目录并扫描到媒体库
+                            saveToPublicAndScan(part1, pureName + "_part1.mp4");
+                            saveToPublicAndScan(part2, pureName + "_part2.mp4");
 
-                            // 添加到媒体库
-                            scanMediaFile(outputPath1);
-                            scanMediaFile(outputPath2);
-
-                            // 获取分割后视频的时长
-                            try {
-                                double duration1 = getVideoDuration(outputPath1);
-                                double duration2 = getVideoDuration(outputPath2);
-
-                                // 显示结果信息
-                                tvStatus.setText(String.format(
-                                        "精确分割完成！\n" +
-                                                "第一部分: %.1f秒, %.1fMB\n" +
-                                                "第二部分: %.1f秒, %.1fMB\n" +
-                                                "分割点: %.1f秒 (精确)",
-                                        duration1,
-                                        outputFile1.length()/(1024.0*1024.0),
-                                        duration2,
-                                        outputFile2.length()/(1024.0*1024.0),
-                                        splitTime));
-                            } catch (IOException e) {
-                                tvStatus.setText(String.format(
-                                        "精确分割完成！\n" +
-                                                "第一部分: %.1fMB\n" +
-                                                "第二部分: %.1fMB",
-                                        outputFile1.length()/(1024.0*1024.0),
-                                        outputFile2.length()/(1024.0*1024.0)));
-                            }
-
+                            tvStatus.setText(String.format(
+                                    "分割完成！\n" +
+                                            "第一部分: %.1fMB\n" +
+                                            "第二部分: %.1fMB",
+                                    part1.length()/(1024.0*1024.0),
+                                    part2.length()/(1024.0*1024.0)));
                             progressBar.setProgress(100);
-                            showToast("精确分割完成，已保存到相册");
+                            showToast("分割完成！");
                         } else {
-                            tvStatus.setText("分割失败：输出文件为空");
-                            showToast("分割失败：输出文件为空");
+                            tvStatus.setText("分割失败：输出文件不存在");
+                            showToast("分割失败：输出文件不存在");
                         }
                     } else {
-                        tvStatus.setText("精确分割失败");
-                        showToast("精确分割失败");
+                        tvStatus.setText("分割失败");
+                        showToast("分割失败");
                     }
                 });
             }).start();
@@ -626,9 +618,66 @@ public class MainActivity extends AppCompatActivity {
             showToast("请输入有效的时间数字");
         } catch (Exception e) {
             showToast("分割出错: " + e.getMessage());
+            Log.e(TAG, "分割视频异常", e);
         }
     }
 
+    // 辅助方法：保存到公共目录并扫描
+    private void saveToPublicAndScan(File sourceFile, String fileName) {
+        if (!sourceFile.exists()) return;
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10+ 使用 MediaStore
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
+                values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+                values.put(MediaStore.Video.Media.RELATIVE_PATH,
+                        Environment.DIRECTORY_MOVIES + "/VideoEditor");
+
+                Uri uri = getContentResolver().insert(
+                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
+
+                if (uri != null) {
+                    try (InputStream in = new FileInputStream(sourceFile);
+                         OutputStream out = getContentResolver().openOutputStream(uri)) {
+                        if (out != null) {
+                            byte[] buffer = new byte[8192];
+                            int bytesRead;
+                            while ((bytesRead = in.read(buffer)) != -1) {
+                                out.write(buffer, 0, bytesRead);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Android 9及以下
+                File moviesDir = Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_MOVIES);
+                File videoEditorDir = new File(moviesDir, "VideoEditor");
+                if (!videoEditorDir.exists()) {
+                    videoEditorDir.mkdirs();
+                }
+
+                File destFile = new File(videoEditorDir, fileName);
+                try (InputStream in = new FileInputStream(sourceFile);
+                     OutputStream out = new FileOutputStream(destFile)) {
+                    byte[] buffer = new byte[8192];
+                    int bytesRead;
+                    while ((bytesRead = in.read(buffer)) != -1) {
+                        out.write(buffer, 0, bytesRead);
+                    }
+                }
+
+                // 扫描到媒体库
+                MediaScannerConnection.scanFile(this,
+                        new String[]{destFile.getAbsolutePath()},
+                        new String[]{"video/mp4"}, null);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "保存到公共目录失败", e);
+        }
+    }
     private void mergeVideos() {
         if (selectedVideoPath == null || selectedSecondVideoPath == null) {
             showToast("请选择两个视频");
