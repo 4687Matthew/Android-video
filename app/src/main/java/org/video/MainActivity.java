@@ -1,13 +1,16 @@
 package org.video;
 
 import static androidx.constraintlayout.helper.widget.MotionEffect.TAG;
+import static org.video.Constants.REQUEST_CODE_SELECT_SECOND_VIDEO;
+import static org.video.Constants.REQUEST_CODE_SELECT_VIDEO;
+import static org.video.Constants.REQUEST_PERMISSION_CODE;
 
 import android.Manifest;
 import android.app.Activity;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.media.MediaMetadataRetriever;
+import android.media.MediaFormat;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
@@ -28,6 +31,10 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import org.video.utils.FileUtils;
+import org.video.utils.TimeUtils;
+import org.video.utils.VideoUtils;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -36,13 +43,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
-import java.util.Objects;
 
 public class MainActivity extends AppCompatActivity {
-    private static final int REQUEST_CODE_SELECT_VIDEO = 1001;
-    private static final int REQUEST_CODE_SELECT_SECOND_VIDEO = 1002;
-    private static final int REQUEST_PERMISSION_CODE = 1000;
 
     private Button btnSelectVideo;
     private Button btnGetInfo;
@@ -179,19 +181,21 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        // 使用FileUtils生成文件名
         String baseName = inputFile.getName();
         int dot = baseName.lastIndexOf('.');
-        String ext = dot >= 0 ? baseName.substring(dot) : ".mp4";
+        String ext = dot >= 0 ? baseName.substring(dot) : Constants.FILE_EXT_MP4;
         String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
-        String fileName = pureName + "_base_hevc" + ext;
+        String fileName = pureName + Constants.SUFFIX_BASE_HEVC + ext;
 
         String outPath;
         try {
             outPath = createPublicVideoFile(fileName);
             File outFile = new File(outPath);
             File parentDir = outFile.getParentFile();
-            if (!parentDir.exists()) {
-                parentDir.mkdirs();
+            if (!FileUtils.ensureDirectoryExists(parentDir)) {
+                showToast("创建输出目录失败");
+                return;
             }
         } catch (IOException e) {
             showToast("创建输出文件失败: " + e.getMessage());
@@ -217,23 +221,28 @@ public class MainActivity extends AppCompatActivity {
         new Thread(() -> {
             // 直接调用单线程转码方法
             boolean ok = VideoEditor.compressToHevcSingleThread(
-                    selectedVideoPath, outPath, 0.45, progressCallback, 0);
+                    selectedVideoPath, outPath, Constants.DEFAULT_COMPRESSION_RATIO,
+                    progressCallback, 0);
 
             runOnUiThread(() -> {
                 showProgress(false);
                 if (ok) {
                     File outputFile = new File(outPath);
                     if (outputFile.exists() && outputFile.length() > 0) {
-                        scanMediaFile(outPath);
+                        // 使用VideoUtils扫描媒体文件
+                        VideoUtils.scanMediaFile(this, outPath);
                         long originalSize = inputFile.length();
                         long compressedSize = outputFile.length();
-                        double ratio = (double) compressedSize / originalSize * 100;
+
+                        // 使用TimeUtils计算压缩比
+                        String ratioStr = TimeUtils.calculateCompressionRatio(originalSize, compressedSize);
+                        // 使用FileUtils获取文件大小描述
+                        String originalSizeStr = FileUtils.getFileSizeDescription(selectedVideoPath);
+                        String compressedSizeStr = FileUtils.getFileSizeDescription(outPath);
 
                         tvStatus.setText(String.format(
-                                "串行压缩完成！原始大小: %.1fMB, 压缩后: %.1fMB, 压缩比: %.1f%%",
-                                originalSize/(1024.0*1024.0),
-                                compressedSize/(1024.0*1024.0),
-                                ratio));
+                                "串行压缩完成！\n原始大小: %s\n压缩后: %s\n压缩比: %s",
+                                originalSizeStr, compressedSizeStr, ratioStr));
                         progressBar.setProgress(100);
                         showToast("串行压缩完成");
                     } else {
@@ -270,22 +279,24 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        // 使用FileUtils生成文件名
         String baseName = inputFile.getName();
         int dot = baseName.lastIndexOf('.');
-        String ext = dot >= 0 ? baseName.substring(dot) : ".mp4";
+        String ext = dot >= 0 ? baseName.substring(dot) : Constants.FILE_EXT_MP4;
         String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
-        String fileName = pureName + "_parallel_hevc" + ext;
+        String fileName = pureName + Constants.SUFFIX_PARALLEL_HEVC + ext;
 
         // 在应用私有目录中创建输出文件
         String outPath = new File(outputDir, fileName).getAbsolutePath();
 
         // 确保目录存在
-        if (!outputDir.exists()) {
-            outputDir.mkdirs();
+        if (!FileUtils.ensureDirectoryExists(outputDir)) {
+            showToast("无法创建输出目录");
+            return;
         }
 
         // 删除已存在的文件
-        new File(outPath).delete();
+        FileUtils.deleteIfExists(outPath);
 
         // 显示进度条和状态
         showProgress(true);
@@ -305,51 +316,55 @@ public class MainActivity extends AppCompatActivity {
         // 在新线程中执行智能压缩
         new Thread(() -> {
             boolean success = VideoEditor.compressVideo(
-                    selectedVideoPath, outPath, 0.45, progressCallback);
+                    selectedVideoPath, outPath, Constants.DEFAULT_COMPRESSION_RATIO, progressCallback);
 
             runOnUiThread(() -> {
                 showProgress(false);
                 if (success) {
                     File outputFile = new File(outPath);
                     if (outputFile.exists() && outputFile.length() > 0) {
-                        // 将文件从私有目录移动到公共目录（使用正确的方法）
-                        String publicPath = saveVideoToPublicDirectory(outputFile, fileName);
+                        // 将文件从私有目录移动到公共目录（使用FileUtils）
+                        String publicPath = FileUtils.saveToPublicDirectory(this, outputFile, fileName);
 
-                        long originalSize = 0;
-                        double ratio = 0;
-                        long compressedSize = 0;
                         if (publicPath != null) {
                             // 扫描到媒体库
-                            scanMediaFile(publicPath);
-                            originalSize = inputFile.length();
-                            compressedSize = outputFile.length();
-                            ratio = (double) compressedSize / originalSize * 100;
+                            VideoUtils.scanMediaFile(this, publicPath);
+                            long originalSize = inputFile.length();
+                            long compressedSize = outputFile.length();
+
+                            // 使用TimeUtils计算压缩比
+                            String ratioStr = TimeUtils.calculateCompressionRatio(originalSize, compressedSize);
+                            // 使用FileUtils获取文件大小描述
+                            String originalSizeStr = FileUtils.getFileSizeDescription(selectedVideoPath);
+                            String compressedSizeStr = FileUtils.getFileSizeDescription(outPath);
 
                             tvStatus.setText(String.format(
                                     "压缩完成！\n" +
-                                            "原始大小: %.1fMB\n" +
-                                            "压缩后: %.1fMB\n" +
-                                            "压缩比: %.1f%%\n" +
+                                            "原始大小: %s\n" +
+                                            "压缩后: %s\n" +
+                                            "压缩比: %s\n" +
                                             "已保存到相册",
-                                    originalSize / (1024.0 * 1024.0),
-                                    compressedSize / (1024.0 * 1024.0),
-                                    ratio));
+                                    originalSizeStr, compressedSizeStr, ratioStr));
                             progressBar.setProgress(100);
                             showToast("压缩完成，已保存到相册");
 
                             // 删除私有目录的临时文件
-                            outputFile.delete();
+                            FileUtils.safeDeleteFile(outputFile);
                         } else {
                             // 如果保存到公共目录失败，显示私有目录位置
+                            long originalSize = inputFile.length();
+                            long compressedSize = outputFile.length();
+                            String ratioStr = TimeUtils.calculateCompressionRatio(originalSize, compressedSize);
+                            String originalSizeStr = FileUtils.getFileSizeDescription(selectedVideoPath);
+                            String compressedSizeStr = FileUtils.getFileSizeDescription(outPath);
+
                             tvStatus.setText(String.format(
                                     "压缩完成！\n" +
-                                            "原始大小: %.1fMB\n" +
-                                            "压缩后: %.1fMB\n" +
-                                            "压缩比: %.1f%%\n" +
+                                            "原始大小: %s\n" +
+                                            "压缩后: %s\n" +
+                                            "压缩比: %s\n" +
                                             "文件保存在应用目录",
-                                    originalSize / (1024.0 * 1024.0),
-                                    compressedSize / (1024.0 * 1024.0),
-                                    ratio));
+                                    originalSizeStr, compressedSizeStr, ratioStr));
                             showToast("压缩完成（文件保存在应用目录）");
                         }
                     } else {
@@ -364,115 +379,53 @@ public class MainActivity extends AppCompatActivity {
         }).start();
     }
 
-    /**
-     * 将视频文件保存到公共目录（相册）
-     */
-    private String saveVideoToPublicDirectory(File sourceFile, String fileName) {
-        if (!sourceFile.exists()) {
-            return null;
-        }
-
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10+ 使用 MediaStore
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
-                values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-                values.put(MediaStore.Video.Media.RELATIVE_PATH,
-                        Environment.DIRECTORY_MOVIES + "/VideoEditor");
-
-                // 需要等待一段时间让系统准备好URI
-                Uri uri = null;
-                for (int i = 0; i < 3; i++) {
-                    try {
-                        uri = getContentResolver().insert(
-                                MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
-                        if (uri != null) break;
-                        Thread.sleep(500);
-                    } catch (Exception e) {
-                        Log.e(TAG, "尝试插入MediaStore失败，重试 " + (i+1), e);
-                    }
-                }
-
-                if (uri == null) {
-                    Log.e(TAG, "无法获取MediaStore URI");
-                    return null;
-                }
-
-                try (InputStream in = new FileInputStream(sourceFile);
-                     OutputStream out = getContentResolver().openOutputStream(uri)) {
-                    if (out == null) {
-                        Log.e(TAG, "无法打开输出流");
-                        return null;
-                    }
-
-                    byte[] buffer = new byte[8192];
-                    int bytesRead;
-                    while ((bytesRead = in.read(buffer)) != -1) {
-                        out.write(buffer, 0, bytesRead);
-                    }
-                    out.flush();
-
-                    // 返回URI字符串供后续使用
-                    return uri.toString();
-                }
-            } else {
-                // Android 9及以下
-                File moviesDir = Environment.getExternalStoragePublicDirectory(
-                        Environment.DIRECTORY_MOVIES);
-                File videoEditorDir = new File(moviesDir, "VideoEditor");
-                if (!videoEditorDir.exists()) {
-                    if (!videoEditorDir.mkdirs()) {
-                        Log.e(TAG, "无法创建目录: " + videoEditorDir.getAbsolutePath());
-                        return null;
-                    }
-                }
-
-                File destFile = new File(videoEditorDir, fileName);
-                try (InputStream in = new FileInputStream(sourceFile);
-                     OutputStream out = new FileOutputStream(destFile)) {
-                    byte[] buffer = new byte[8192];
-                    int bytesRead;
-                    while ((bytesRead = in.read(buffer)) != -1) {
-                        out.write(buffer, 0, bytesRead);
-                    }
-                    out.flush();
-                }
-
-                // 扫描到媒体库
-                MediaScannerConnection.scanFile(this,
-                        new String[]{destFile.getAbsolutePath()},
-                        new String[]{"video/mp4"}, null);
-
-                return destFile.getAbsolutePath();
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "保存到公共目录失败", e);
-            return null;
-        }
-    }
-
     private void getVideoInfo() {
         if (selectedVideoPath == null) {
             showToast("请先选择视频");
             return;
         }
+
+        if (!VideoUtils.isValidVideoFile(selectedVideoPath)) {
+            showToast("视频文件无效");
+            return;
+        }
+
         showProgress(true);
         tvStatus.setText("正在获取视频信息...");
 
         new Thread(() -> {
-            String info = VideoEditor.getVideoInfo(selectedVideoPath);
-            runOnUiThread(() -> {
-                VideoInfo.setText(info);
-                showProgress(false);
-                tvStatus.setText("视频信息获取完成");
-            });
+            try {
+                // 使用VideoUtils获取轨道信息
+                MediaFormat[] formats = VideoUtils.getTrackFormats(selectedVideoPath);
+                MediaFormat videoFormat = formats[0];
+
+                String info;
+                if (videoFormat != null) {
+                    // 使用VideoUtils获取详细视频信息
+                    info = VideoUtils.getVideoInfoString(videoFormat);
+                } else {
+                    info = "未找到视频轨道";
+                }
+
+                final String finalInfo = info;
+                runOnUiThread(() -> {
+                    VideoInfo.setText(finalInfo);
+                    showProgress(false);
+                    tvStatus.setText("视频信息获取完成");
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    VideoInfo.setText("获取信息失败: " + e.getMessage());
+                    showProgress(false);
+                    tvStatus.setText("视频信息获取失败");
+                });
+            }
         }).start();
     }
 
     private void selectVideo(int requestCode) {
         Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
-        intent.setType("video/*");
+        intent.setType(Constants.MIME_TYPE_VIDEO);
         startActivityForResult(Intent.createChooser(intent, "选择视频"), requestCode);
     }
 
@@ -483,7 +436,7 @@ public class MainActivity extends AppCompatActivity {
         if (resultCode == Activity.RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri != null) {
-                String path = VideoEditorUtils.getPathFromUri(this, uri);
+                String path = VideoUtils.getPathFromUri(this, uri);
                 if (requestCode == REQUEST_CODE_SELECT_VIDEO) {
                     selectedVideoPath = path;
                     tvVideoPath.setText("视频: " + (path != null ? new File(path).getName() : "未知"));
@@ -501,6 +454,11 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        if (!VideoUtils.isValidVideoFile(selectedVideoPath)) {
+            showToast("视频文件无效");
+            return;
+        }
+
         String startStr = etCropStart.getText().toString();
         String endStr = etCropEnd.getText().toString();
 
@@ -513,59 +471,45 @@ public class MainActivity extends AppCompatActivity {
             double startTime = Double.parseDouble(startStr);
             double endTime = Double.parseDouble(endStr);
 
-            if (startTime >= endTime) {
-                showToast("开始时间必须小于结束时间");
+            // 使用TimeUtils验证时间范围
+            if (!TimeUtils.isValidTimeRange(startTime, endTime, Constants.MIN_VIDEO_DURATION)) {
+                showToast("开始时间必须小于结束时间，且时长不小于1秒");
                 return;
             }
 
-            // 获取视频总时长
-            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-            double totalDuration = 0;
-            try {
-                retriever.setDataSource(selectedVideoPath);
-                String durationStr = retriever.extractMetadata(
-                        MediaMetadataRetriever.METADATA_KEY_DURATION);
-                if (durationStr != null) {
-                    totalDuration = Long.parseLong(durationStr) / 1000.0;
+            // 获取视频总时长（使用TimeUtils转换）
+            long totalDurationMs = VideoUtils.getVideoDurationMs(selectedVideoPath);
+            double totalDuration = TimeUtils.microsecondsToSeconds(TimeUtils.millisecondsToMicroseconds(totalDurationMs));
 
-                    // 验证裁剪时间
-                    if (startTime < 0) startTime = 0;
-                    if (endTime > totalDuration) endTime = totalDuration;
-
-                    if (endTime - startTime < 1.0) {
-                        showToast("裁剪时长不能小于1秒");
-                        return;
-                    }
-
-                    tvStatus.setText(String.format("视频总时长: %.1f秒，将裁剪 %.1f-%.1f秒",
-                            totalDuration, startTime, endTime));
-                } else {
-                    showToast("无法获取视频时长");
-                    return;
-                }
-            } finally {
-                retriever.release();
-            }
-
-            // 使用应用私有目录
-            File outputDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
-            if (outputDir == null) {
-                showToast("无法创建输出目录");
+            if (totalDuration <= 0) {
+                showToast("无法获取视频时长");
                 return;
             }
 
+            // 验证裁剪时间
+            if (startTime < 0) startTime = 0;
+            if (endTime > totalDuration) endTime = totalDuration;
+
+            // 使用TimeUtils验证裁剪时长
+            if (!TimeUtils.isValidTimeRange(startTime, endTime, Constants.MIN_VIDEO_DURATION)) {
+                showToast("裁剪时长不能小于1秒");
+                return;
+            }
+
+            tvStatus.setText(String.format("视频总时长: %.1f秒，将裁剪 %.1f-%.1f秒",
+                    totalDuration, startTime, endTime));
+
+            // 使用FileUtils创建输出路径
             String baseName = new File(selectedVideoPath).getName();
-            int dot = baseName.lastIndexOf('.');
-            String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
-            String ext = dot >= 0 ? baseName.substring(dot) : ".mp4";
+            String outputPath = FileUtils.createPrivateOutputPath(this, selectedVideoPath, Constants.SUFFIX_CROPPED);
 
-            String outputPath = new File(outputDir,
-                    pureName + "_cropped_" +
-                            String.format(Locale.US, "%.1f-%.1f", startTime, endTime) +
-                            ext).getAbsolutePath();
+            if (outputPath == null) {
+                showToast("无法创建输出文件");
+                return;
+            }
 
             // 确保输出文件不存在
-            new File(outputPath).delete();
+            FileUtils.deleteIfExists(outputPath);
 
             Log.d(TAG, "输出路径: " + outputPath);
 
@@ -588,10 +532,13 @@ public class MainActivity extends AppCompatActivity {
             double finalStartTime = startTime;
             double finalEndTime = endTime;
             new Thread(() -> {
+                // 使用TimeUtils转换时间单位
+                long startTimeUs = TimeUtils.secondsToMicroseconds(finalStartTime);
+                long endTimeUs = TimeUtils.secondsToMicroseconds(finalEndTime);
+
                 boolean success = VideoEditor.cropVideoOptimized(
                         selectedVideoPath, outputPath,
-                        (long)(finalStartTime * 1000000),
-                        (long)(finalEndTime * 1000000),
+                        startTimeUs, endTimeUs,
                         progressCallback);
 
                 runOnUiThread(() -> {
@@ -600,28 +547,31 @@ public class MainActivity extends AppCompatActivity {
                         File croppedFile = new File(outputPath);
 
                         if (croppedFile.exists() && croppedFile.length() > 0) {
-                            // 先记录文件大小
-                            long fileSize = croppedFile.length();
+                            // 使用FileUtils获取文件大小
+                            String fileSizeStr = FileUtils.getFileSizeDescription(outputPath);
 
                             // 将文件保存到公共目录并扫描到媒体库
-                            boolean saved = saveToPublicAndScan(croppedFile,
-                                    pureName + "_cropped_" +
-                                            String.format(Locale.US, "%.1f-%.1f", finalStartTime, finalEndTime) +
-                                            ext);
+                            String fileName = FileUtils.generateTimestampFilename(
+                                    new File(selectedVideoPath).getName(),
+                                    Constants.SUFFIX_CROPPED);
+
+                            boolean saved = saveToPublicAndScan(croppedFile, fileName);
 
                             // 保存成功后删除临时文件
                             if (saved && croppedFile.exists()) {
-                                croppedFile.delete();
+                                FileUtils.safeDeleteFile(croppedFile);
                                 Log.d(TAG, "删除裁剪临时文件: " + croppedFile.getAbsolutePath());
                             }
 
+                            // 使用TimeUtils格式化时长
+                            String durationStr = TimeUtils.formatSeconds(finalEndTime - finalStartTime);
+
                             tvStatus.setText(String.format(
                                     "裁剪完成！\n" +
-                                            "大小: %.1fMB\n" +
-                                            "时长: %.1f秒\n" +
+                                            "大小: %s\n" +
+                                            "时长: %s\n" +
                                             "已保存到相册",
-                                    fileSize/(1024.0*1024.0),
-                                    (finalEndTime - finalStartTime)));
+                                    fileSizeStr, durationStr));
                             progressBar.setProgress(100);
 
                             if (saved) {
@@ -630,8 +580,8 @@ public class MainActivity extends AppCompatActivity {
                                 showToast("裁剪完成，但保存到相册失败");
                             }
 
-                            // 清理缓存
-                            cleanupVideoCache();
+                            // 使用FileUtils清理缓存
+                            FileUtils.cleanupVideoEditorCache(MainActivity.this);
                         } else {
                             tvStatus.setText("裁剪失败：输出文件不存在");
                             showToast("裁剪失败：输出文件不存在");
@@ -657,6 +607,11 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        if (!VideoUtils.isValidVideoFile(selectedVideoPath)) {
+            showToast("视频文件无效");
+            return;
+        }
+
         String splitTimeStr = etSplitTime.getText().toString();
         if (splitTimeStr.isEmpty()) {
             showToast("请输入分割时间");
@@ -667,52 +622,42 @@ public class MainActivity extends AppCompatActivity {
             double splitTime = Double.parseDouble(splitTimeStr);
 
             // 获取视频总时长
-            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-            double totalDuration = 0;
-            try {
-                retriever.setDataSource(selectedVideoPath);
-                String durationStr = retriever.extractMetadata(
-                        MediaMetadataRetriever.METADATA_KEY_DURATION);
-                if (durationStr != null) {
-                    totalDuration = Long.parseLong(durationStr) / 1000.0;
+            long totalDurationMs = VideoUtils.getVideoDurationMs(selectedVideoPath);
+            double totalDuration = TimeUtils.microsecondsToSeconds(TimeUtils.millisecondsToMicroseconds(totalDurationMs));
 
-                    // 验证分割时间
-                    if (splitTime < 1.0) {
-                        showToast("分割时间不能小于1秒");
-                        return;
-                    }
-                    if (splitTime > totalDuration - 1.0) {
-                        showToast(String.format("分割时间不能超过%.1f秒", totalDuration - 1.0));
-                        return;
-                    }
-
-                    tvStatus.setText(String.format("视频总时长: %.1f秒，将在 %.1f秒 处分割",
-                            totalDuration, splitTime));
-                } else {
-                    showToast("无法获取视频时长");
-                    return;
-                }
-            } finally {
-                retriever.release();
-            }
-
-            // 使用应用私有目录避免权限问题
-            File outputDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
-            if (outputDir == null) {
-                showToast("无法创建输出目录");
+            if (totalDuration <= 0) {
+                showToast("无法获取视频时长");
                 return;
             }
 
-            String baseName = new File(selectedVideoPath).getName();
-            int dot = baseName.lastIndexOf('.');
-            String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
+            // 使用TimeUtils验证分割时间
+            if (splitTime < Constants.MIN_VIDEO_DURATION) {
+                showToast("分割时间不能小于1秒");
+                return;
+            }
 
-            String outputPath1 = new File(outputDir, pureName + "_part1.mp4").getAbsolutePath();
-            String outputPath2 = new File(outputDir, pureName + "_part2.mp4").getAbsolutePath();
+            if (splitTime > totalDuration - Constants.MIN_VIDEO_DURATION) {
+                showToast(String.format("分割时间不能超过%.1f秒", totalDuration - Constants.MIN_VIDEO_DURATION));
+                return;
+            }
+
+            tvStatus.setText(String.format("视频总时长: %.1f秒，将在 %.1f秒 处分割",
+                    totalDuration, splitTime));
+
+            // 使用FileUtils创建输出路径
+            String baseName = new File(selectedVideoPath).getName();
+
+            String outputPath1 = FileUtils.createPrivateOutputPath(this, selectedVideoPath, Constants.PREFIX_PART + "1");
+            String outputPath2 = FileUtils.createPrivateOutputPath(this, selectedVideoPath, Constants.PREFIX_PART + "2");
+
+            if (outputPath1 == null || outputPath2 == null) {
+                showToast("无法创建输出文件");
+                return;
+            }
 
             // 确保输出文件不存在
-            new File(outputPath1).delete();
-            new File(outputPath2).delete();
+            FileUtils.deleteIfExists(outputPath1);
+            FileUtils.deleteIfExists(outputPath2);
 
             Log.d(TAG, "输出路径1: " + outputPath1);
             Log.d(TAG, "输出路径2: " + outputPath2);
@@ -734,9 +679,12 @@ public class MainActivity extends AppCompatActivity {
 
             // 在新线程中执行分割
             new Thread(() -> {
+                // 使用TimeUtils转换时间单位
+                long splitTimeUs = TimeUtils.secondsToMicroseconds(splitTime);
+
                 boolean success = VideoEditor.splitVideoOptimized(
                         selectedVideoPath, outputPath1, outputPath2,
-                        (long)(splitTime * 1000000), progressCallback);
+                        splitTimeUs, progressCallback);
 
                 runOnUiThread(() -> {
                     showProgress(false);
@@ -745,32 +693,38 @@ public class MainActivity extends AppCompatActivity {
                         File part2 = new File(outputPath2);
 
                         if (part1.exists() && part2.exists()) {
-                            // 先记录文件大小
-                            long part1Size = part1.length();
-                            long part2Size = part2.length();
+                            // 使用FileUtils获取文件大小
+                            String part1SizeStr = FileUtils.getFileSizeDescription(outputPath1);
+                            String part2SizeStr = FileUtils.getFileSizeDescription(outputPath2);
 
                             // 将文件保存到公共目录并扫描到媒体库
-                            boolean saved1 = saveToPublicAndScan(part1, pureName + "_part1.mp4");
-                            boolean saved2 = saveToPublicAndScan(part2, pureName + "_part2.mp4");
+                            String part1Name = FileUtils.generateSequentialFilename(
+                                    new File(selectedVideoPath).getName(),
+                                    Constants.PREFIX_PART, 1);
+                            String part2Name = FileUtils.generateSequentialFilename(
+                                    new File(selectedVideoPath).getName(),
+                                    Constants.PREFIX_PART, 2);
+
+                            boolean saved1 = saveToPublicAndScan(part1, part1Name);
+                            boolean saved2 = saveToPublicAndScan(part2, part2Name);
 
                             // 保存成功后删除临时文件
                             if (saved1 && part1.exists()) {
-                                part1.delete();
+                                FileUtils.safeDeleteFile(part1);
                                 Log.d(TAG, "删除临时文件1: " + part1.getAbsolutePath());
                             }
                             if (saved2 && part2.exists()) {
-                                part2.delete();
+                                FileUtils.safeDeleteFile(part2);
                                 Log.d(TAG, "删除临时文件2: " + part2.getAbsolutePath());
                             }
 
-                            // 使用之前记录的文件大小显示
+                            // 使用FileUtils获取的文件大小显示
                             tvStatus.setText(String.format(
                                     "分割完成！\n" +
-                                            "第一部分: %.1fMB\n" +
-                                            "第二部分: %.1fMB\n" +
+                                            "第一部分: %s\n" +
+                                            "第二部分: %s\n" +
                                             "已保存到相册",
-                                    part1Size/(1024.0*1024.0),
-                                    part2Size/(1024.0*1024.0)));
+                                    part1SizeStr, part2SizeStr));
                             progressBar.setProgress(100);
 
                             if (saved1 && saved2) {
@@ -779,8 +733,8 @@ public class MainActivity extends AppCompatActivity {
                                 showToast("分割完成，部分文件保存失败");
                             }
 
-                            // 清理视频编辑器的临时缓存目录
-                            cleanupVideoCache();
+                            // 使用FileUtils清理缓存
+                            FileUtils.cleanupVideoEditorCache(MainActivity.this);
                         } else {
                             tvStatus.setText("分割失败：输出文件不存在");
                             showToast("分割失败：输出文件不存在");
@@ -800,338 +754,31 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // 辅助方法：保存到公共目录并扫描
-    private boolean saveToPublicAndScan(File sourceFile, String fileName) {
-        if (!sourceFile.exists()) {
-            Log.e(TAG, "源文件不存在: " + sourceFile.getAbsolutePath());
-            return false;
-        }
-
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10+ 使用 MediaStore
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
-                values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-                values.put(MediaStore.Video.Media.RELATIVE_PATH,
-                        Environment.DIRECTORY_MOVIES + "/VideoEditor");
-
-                Uri uri = getContentResolver().insert(
-                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
-
-                if (uri != null) {
-                    try (InputStream in = new FileInputStream(sourceFile);
-                         OutputStream out = getContentResolver().openOutputStream(uri)) {
-                        if (out != null) {
-                            byte[] buffer = new byte[8192];
-                            int bytesRead;
-                            while ((bytesRead = in.read(buffer)) != -1) {
-                                out.write(buffer, 0, bytesRead);
-                            }
-                            out.flush();
-                            Log.d(TAG, "文件已保存到MediaStore: " + uri.toString());
-
-                            // 触发媒体扫描
-                            scanMediaFile(uri.toString());
-                            return true;
-                        }
-                    }
-                }
-            } else {
-                // Android 9及以下
-                File moviesDir = Environment.getExternalStoragePublicDirectory(
-                        Environment.DIRECTORY_MOVIES);
-                File videoEditorDir = new File(moviesDir, "VideoEditor");
-                if (!videoEditorDir.exists()) {
-                    videoEditorDir.mkdirs();
-                }
-
-                File destFile = new File(videoEditorDir, fileName);
-                try (InputStream in = new FileInputStream(sourceFile);
-                     OutputStream out = new FileOutputStream(destFile)) {
-                    byte[] buffer = new byte[8192];
-                    int bytesRead;
-                    while ((bytesRead = in.read(buffer)) != -1) {
-                        out.write(buffer, 0, bytesRead);
-                    }
-                    out.flush();
-                }
-
-                // 扫描到媒体库
-                MediaScannerConnection.scanFile(this,
-                        new String[]{destFile.getAbsolutePath()},
-                        new String[]{"video/mp4"}, null);
-
-                Log.d(TAG, "文件已保存到公共目录: " + destFile.getAbsolutePath());
-                return true;
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "保存到公共目录失败", e);
-            return false;
-        }
-        return false;
-    }
-
-    /**
-     * 清理视频编辑器的所有临时缓存（使用强制删除）
-     */
-    private void cleanupVideoCache() {
-        // 使用同步锁避免多个线程同时清理
-        synchronized (MainActivity.class) {
-            new Thread(() -> {
-                try {
-                    Log.d(TAG, "开始清理视频缓存...");
-
-                    // 清理应用缓存目录
-                    File cacheDir = getExternalCacheDir();
-                    if (cacheDir != null && cacheDir.exists()) {
-                        Log.d(TAG, "清理应用缓存目录: " + cacheDir.getAbsolutePath());
-                        safeDeleteDirectory(cacheDir);
-                    }
-
-                    // 清理视频编辑器私有目录的临时文件（使用强制删除）
-                    File videoDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
-                    if (videoDir != null && videoDir.exists()) {
-                        Log.d(TAG, "清理视频临时文件目录: " + videoDir.getAbsolutePath());
-                        safeDeleteTempFiles(videoDir);
-                    }
-
-                    // 清理VideoEditor类的缓存目录（使用强制删除）
-                    File editorCacheDir = VideoEditor.getCacheDir();
-                    if (editorCacheDir.exists()) {
-                        Log.d(TAG, "清理VideoEditor缓存目录: " + editorCacheDir.getAbsolutePath());
-                        safeDeleteDirectory(editorCacheDir);
-                    }
-
-                    Log.d(TAG, "视频缓存清理完成");
-                } catch (Exception e) {
-                    Log.e(TAG, "清理缓存失败", e);
-                }
-            }).start();
-        }
-    }
-
-    /**
-     * 安全删除目录（避免竞争条件）
-     */
-    private void safeDeleteDirectory(File directory) {
-        if (directory == null || !directory.exists()) {
-            return;
-        }
-
-        synchronized (MainActivity.class) {
-            try {
-                // 首先检查目录是否仍然存在
-                if (!directory.exists()) {
-                    return;
-                }
-
-                // 递归删除目录内容
-                if (directory.isDirectory()) {
-                    File[] files = directory.listFiles();
-                    if (files != null) {
-                        for (File file : files) {
-                            if (file.isDirectory()) {
-                                safeDeleteDirectory(file);
-                            } else {
-                                safeDeleteFile(file);
-                            }
-                        }
-                    }
-                }
-
-                // 删除目录本身
-                if (directory.exists()) {
-                    boolean deleted = directory.delete();
-                    if (!deleted) {
-                        // 如果删除失败，尝试重试一次
-                        Thread.sleep(100);
-                        directory.delete();
-                    }
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "安全删除目录异常: " + directory.getAbsolutePath(), e);
-            }
-        }
-    }
-
-    /**
-     * 安全删除文件（避免竞争条件）
-     */
-    private boolean safeDeleteFile(File file) {
-        if (file == null || !file.exists()) {
-            return true;
-        }
-
-        synchronized (MainActivity.class) {
-            try {
-                // 再次检查文件是否存在
-                if (!file.exists()) {
-                    return true;
-                }
-
-                // 方法1：直接删除
-                boolean deleted = file.delete();
-
-                if (!deleted) {
-                    // 方法2：设置可写后删除
-                    file.setWritable(true);
-                    deleted = file.delete();
-
-                    if (!deleted) {
-                        // 方法3：重命名为临时名称再删除
-                        String tempName = file.getAbsolutePath() + ".deleted_" + System.currentTimeMillis();
-                        File tempFile = new File(tempName);
-
-                        if (file.renameTo(tempFile)) {
-                            deleted = tempFile.delete();
-                            if (!deleted) {
-                                Log.w(TAG, "重命名后删除失败: " + tempFile.getAbsolutePath());
-                            }
-                        } else {
-                            Log.w(TAG, "重命名失败: " + file.getAbsolutePath());
-                        }
-                    }
-                }
-
-                return deleted;
-            } catch (Exception e) {
-                Log.e(TAG, "安全删除文件异常: " + file.getAbsolutePath(), e);
-                return false;
-            }
-        }
-    }
-
-    /**
-     * 安全删除临时文件
-     */
-    private void safeDeleteTempFiles(File directory) {
-        if (!directory.exists() || !directory.isDirectory()) {
-            return;
-        }
-
-        synchronized (MainActivity.class) {
-            try {
-                File[] files = directory.listFiles();
-                if (files == null) return;
-
-                for (File file : files) {
-                    if (file.isDirectory()) {
-                        // 如果是临时目录，完全删除
-                        String dirName = file.getName().toLowerCase();
-                        if (dirName.contains("temp") || dirName.contains("cache")) {
-                            safeDeleteDirectory(file);
-                        } else {
-                            safeDeleteTempFiles(file);
-                        }
-                    } else {
-                        // 删除临时文件，保留.mp4文件（用户可能还没保存）
-                        String name = file.getName().toLowerCase();
-                        if (name.startsWith("temp_") ||
-                                name.startsWith("video_segment_") ||
-                                name.startsWith("audio_") ||
-                                name.startsWith("merged_video_") ||
-                                name.startsWith("cache_")) {
-                            safeDeleteFile(file);
-                            Log.d(TAG, "安全删除临时文件: " + file.getName());
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "安全删除临时文件异常", e);
-            }
-        }
-    }
-
-    /**
-     * 强制删除临时文件（保留.mp4扩展名的文件，因为它们可能是用户需要的）
-     */
-    private void deleteTempFilesForce(File directory) {
-        if (!directory.exists() || !directory.isDirectory()) {
-            return;
-        }
-
-        File[] files = directory.listFiles();
-        if (files == null) return;
-
-        for (File file : files) {
-            if (file.isDirectory()) {
-                deleteTempFilesForce(file);
-                // 如果是空目录，强制删除它
-                if (file.listFiles() == null || Objects.requireNonNull(file.listFiles()).length == 0) {
-                    forceDeleteFile(file);
-                }
-            } else {
-                // 删除临时文件，保留.mp4文件（用户可能还没保存）
-                String name = file.getName().toLowerCase();
-                if (name.startsWith("temp_") ||
-                        name.startsWith("video_segment_") ||
-                        name.startsWith("audio_") ||
-                        name.startsWith("merged_video_") ||
-                        name.startsWith("cache_")) {
-                    forceDeleteFile(file);
-                    Log.d(TAG, "强制删除临时文件: " + file.getName());
-                }
-            }
-        }
-    }
-
-    /**
-     * 递归删除目录
-     */
-    private void deleteDirectory(File directory) {
-        if (!directory.exists() || !directory.isDirectory()) {
-            return;
-        }
-
-        File[] files = directory.listFiles();
-        if (files == null) return;
-
-        for (File file : files) {
-            if (file.isDirectory()) {
-                deleteDirectory(file);
-            }
-            // 不删除目录本身，只删除内容
-            if (!file.isDirectory()) {
-                file.delete();
-            }
-        }
-    }
-
     private void mergeVideos() {
         if (selectedVideoPath == null || selectedSecondVideoPath == null) {
             showToast("请选择两个视频");
             return;
         }
 
-        // 使用与分割、裁剪一致的路径格式
-        File outputDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
-        if (outputDir == null) {
-            showToast("无法创建输出目录");
+        if (!VideoUtils.isValidVideoFile(selectedVideoPath) || !VideoUtils.isValidVideoFile(selectedSecondVideoPath)) {
+            showToast("视频文件无效");
             return;
         }
 
-        String baseName = new File(selectedVideoPath).getName();
-        int dot = baseName.lastIndexOf('.');
-        String pureName = dot >= 0 ? baseName.substring(0, dot) : baseName;
-        String ext = dot >= 0 ? baseName.substring(dot) : ".mp4";
+        // 使用FileUtils创建输出路径
+        String outputPath = FileUtils.createPrivateOutputPath(this, selectedVideoPath, Constants.SUFFIX_MERGED);
 
-        // 使用final变量，以便在lambda中使用
-        final String outputPath = new File(outputDir,
-                pureName + "_merged_" + System.currentTimeMillis() + ext).getAbsolutePath();
-
-        // 用于lambda表达式的final数组，用于存储文件大小
-        final long[] fileSizeHolder = new long[1];
-
-        // 使用final变量存储文件名
-        final String finalPublicFileName = pureName + "_merged_" + System.currentTimeMillis() + ext;
+        if (outputPath == null) {
+            showToast("无法创建输出文件");
+            return;
+        }
 
         // 确保输出文件不存在
         File outputFile = new File(outputPath);
-        if (outputFile.exists()) {
-            // 强制删除，不进入回收站
-            forceDeleteFile(outputFile);
-        }
+        FileUtils.deleteIfExists(outputPath);
+
+        // 用于lambda表达式的final数组，用于存储文件大小
+        final long[] fileSizeHolder = new long[1];
 
         // 显示进度条和状态
         showProgress(true);
@@ -1156,57 +803,60 @@ public class MainActivity extends AppCompatActivity {
                     outputPath,
                     progressCallback);
 
-            // 在子线程中获取文件信息，避免lambda中的变量问题
-            File resultFile = new File(outputPath);
-            long fileSize = resultFile.exists() ? resultFile.length() : 0;
+            // 在子线程中获取文件信息
+            long fileSize = outputFile.exists() ? outputFile.length() : 0;
             fileSizeHolder[0] = fileSize;
 
             runOnUiThread(() -> {
                 showProgress(false);
 
                 // 重新检查文件
-                File finalOutputFile = new File(outputPath);
-                boolean fileExists = finalOutputFile.exists();
+                boolean fileExists = outputFile.exists();
                 long finalFileSize = fileSizeHolder[0];
 
                 if (success && fileExists && finalFileSize > 0) {
+                    // 使用FileUtils生成文件名
+                    String fileName = FileUtils.generateTimestampFilename(
+                            new File(selectedVideoPath).getName(),
+                            Constants.SUFFIX_MERGED);
+
                     // 调用已有的保存方法
-                    boolean saved = saveToPublicAndScan(finalOutputFile, finalPublicFileName);
+                    boolean saved = saveToPublicAndScan(outputFile, fileName);
 
                     if (saved) {
-                        // 强制删除临时文件，不进入回收站
-                        boolean deleted = safeDeleteFile(finalOutputFile);
+                        // 删除临时文件
+                        boolean deleted = FileUtils.safeDeleteFile(outputFile);
                         if (deleted) {
                             Log.d(TAG, "成功删除合并临时文件: " + outputPath);
                         } else {
                             Log.w(TAG, "删除合并临时文件失败: " + outputPath);
                         }
 
-                        // 计算文件大小
-                        double sizeInMB = finalFileSize / (1024.0 * 1024.0);
+                        // 使用FileUtils获取文件大小
+                        String sizeStr = FileUtils.getFileSizeDescription(outputPath);
                         tvStatus.setText(String.format(
                                 "合并完成！\n" +
-                                        "大小: %.1fMB\n" +
+                                        "大小: %s\n" +
                                         "已保存到相册",
-                                sizeInMB));
+                                sizeStr));
                         progressBar.setProgress(100);
                         showToast("合并完成！已保存到相册");
 
                         // 调用统一的缓存清理
-                        cleanupVideoCache();
+                        FileUtils.cleanupVideoEditorCache(this);
                     } else {
                         // 如果保存失败，显示应用目录位置
-                        double sizeInMB = finalFileSize / (1024.0 * 1024.0);
+                        String sizeStr = FileUtils.getFileSizeDescription(outputPath);
                         tvStatus.setText(String.format(
                                 "合并完成！\n" +
-                                        "大小: %.1fMB\n" +
+                                        "大小: %s\n" +
                                         "文件保存在应用目录",
-                                sizeInMB));
+                                sizeStr));
                         showToast("合并完成（保存在应用目录）");
                     }
                 } else if (success && fileExists) {
                     // 文件大小为0的情况
-                    forceDeleteFile(finalOutputFile);
+                    FileUtils.safeDeleteFile(outputFile);
                     tvStatus.setText("合并失败：输出文件大小为0");
                     showToast("合并失败：输出文件大小为0");
                 } else {
@@ -1214,117 +864,23 @@ public class MainActivity extends AppCompatActivity {
                     showToast("合并失败");
 
                     // 清理可能创建的无效文件
-                    forceDeleteFile(finalOutputFile);
+                    FileUtils.safeDeleteFile(outputFile);
                 }
 
                 // 无论成功失败，都清理缓存
-                cleanupVideoCache();
+                FileUtils.cleanupVideoEditorCache(this);
             });
         }).start();
-    }
-
-    /**
-     * 强制删除文件，不进入回收站
-     * 使用多种方法确保文件被彻底删除
-     */
-    private boolean forceDeleteFile(File file) {
-        if (file == null || !file.exists()) {
-            return true;
-        }
-
-        // 使用同步锁避免竞争条件
-        synchronized (MainActivity.class) {
-            try {
-                // 再次检查文件是否存在
-                if (!file.exists()) {
-                    return true;
-                }
-
-                // 方法1：直接删除
-                boolean deleted = file.delete();
-
-                if (!deleted) {
-                    // 方法2：设置可写后删除
-                    file.setWritable(true);
-                    deleted = file.delete();
-
-                    if (!deleted) {
-                        // 方法3：重命名为临时名称再删除
-                        String tempName = file.getAbsolutePath() + ".deleted_" + System.currentTimeMillis();
-                        File tempFile = new File(tempName);
-
-                        if (file.renameTo(tempFile)) {
-                            deleted = tempFile.delete();
-                            if (!deleted) {
-                                Log.w(TAG, "重命名后删除失败: " + tempFile.getAbsolutePath());
-                            }
-                        } else {
-                            Log.w(TAG, "重命名失败，直接删除: " + file.getAbsolutePath());
-                        }
-                    }
-                }
-
-                return deleted;
-            } catch (Exception e) {
-                Log.e(TAG, "强制删除文件异常: " + file.getAbsolutePath(), e);
-
-                // 最后尝试方案
-                try {
-                    file.setWritable(true);
-                    return file.delete();
-                } catch (Exception ex) {
-                    Log.e(TAG, "设置可写后删除失败", ex);
-                    return false;
-                }
-            }
-        }
-    }
-
-    /**
-     * 强制删除目录及其内容
-     */
-    private boolean forceDeleteDirectory(File directory) {
-        if (directory == null || !directory.exists()) {
-            return true;
-        }
-
-        // 使用同步锁避免竞争条件
-        synchronized (MainActivity.class) {
-            try {
-                // 再次检查目录是否存在
-                if (!directory.exists()) {
-                    return true;
-                }
-
-                if (directory.isDirectory()) {
-                    File[] files = directory.listFiles();
-                    if (files != null) {
-                        for (File file : files) {
-                            if (file.isDirectory()) {
-                                forceDeleteDirectory(file);
-                            } else {
-                                forceDeleteFile(file);
-                            }
-                        }
-                    }
-                }
-
-                // 删除目录本身
-                if (directory.exists()) {
-                    return forceDeleteFile(directory);
-                }
-
-                return true;
-            } catch (Exception e) {
-                Log.e(TAG, "强制删除目录异常: " + directory.getAbsolutePath(), e);
-                return false;
-            }
-        }
     }
 
     private void adjustSpeed(boolean speedUp) {
         if (selectedVideoPath == null) {
             showToast("请先选择视频");
+            return;
+        }
+
+        if (!VideoUtils.isValidVideoFile(selectedVideoPath)) {
+            showToast("视频文件无效");
             return;
         }
 
@@ -1347,8 +903,16 @@ public class MainActivity extends AppCompatActivity {
         }
 
         final double finalSpeedFactor = speedFactor;
-        String outputPath = getOutputPath((speedUp ? "speedup_" : "slowdown_") +
-                System.currentTimeMillis() + ".mp4");
+
+        // 使用FileUtils创建输出路径
+        String suffix = speedUp ? Constants.SUFFIX_SPEEDUP : Constants.SUFFIX_SLOWDOWN;
+        String outputPath = FileUtils.createPrivateOutputPath(this, selectedVideoPath, suffix);
+
+        if (outputPath == null) {
+            showToast("无法创建输出文件");
+            return;
+        }
+
         showProgress(true);
         tvStatus.setText("正在调节速度...");
 
@@ -1358,12 +922,20 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 showProgress(false);
                 if (success) {
-                    String savedPath = saveToPublicDirectory(outputPath,
-                            (speedUp ? "speedup_" : "slowdown_") + System.currentTimeMillis() + ".mp4");
+                    File outputFile = new File(outputPath);
+
+                    // 使用FileUtils生成文件名
+                    String fileName = FileUtils.generateTimestampFilename(
+                            new File(selectedVideoPath).getName(),
+                            speedUp ? Constants.SUFFIX_SPEEDUP : Constants.SUFFIX_SLOWDOWN);
+
+                    // 使用FileUtils保存到公共目录
+                    String savedPath = FileUtils.saveToPublicDirectory(MainActivity.this, outputFile, fileName);
+
                     if (savedPath != null) {
                         tvStatus.setText("速度调节成功: " + new File(savedPath).getName());
                         showToast("速度调节成功，已保存到相册");
-                        scanMediaFile(savedPath);
+                        VideoUtils.scanMediaFile(MainActivity.this, savedPath);
                     } else {
                         tvStatus.setText("速度调节成功: " + new File(outputPath).getName());
                         showToast("速度调节成功（保存在应用目录）");
@@ -1374,81 +946,6 @@ public class MainActivity extends AppCompatActivity {
                 }
             });
         }).start();
-    }
-
-    private String getOutputPath(String filename) {
-        File outputDir = new File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "edited");
-        if (!outputDir.exists()) {
-            outputDir.mkdirs();
-        }
-        return new File(outputDir, filename).getAbsolutePath();
-    }
-
-    private String saveToPublicDirectory(String sourcePath, String filename) {
-        try {
-            File sourceFile = new File(sourcePath);
-            if (!sourceFile.exists()) {
-                return null;
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.Video.Media.DISPLAY_NAME, filename);
-                values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-                values.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/VideoEditor");
-
-                Uri uri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
-                if (uri != null) {
-                    try (InputStream in = new FileInputStream(sourceFile);
-                         OutputStream out = getContentResolver().openOutputStream(uri)) {
-                        if (out != null) {
-                            byte[] buffer = new byte[8192];
-                            int bytesRead;
-                            while ((bytesRead = in.read(buffer)) != -1) {
-                                out.write(buffer, 0, bytesRead);
-                            }
-                            return uri.toString();
-                        }
-                    }
-                }
-            } else {
-                File moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES);
-                File videoEditorDir = new File(moviesDir, "VideoEditor");
-                if (!videoEditorDir.exists()) {
-                    videoEditorDir.mkdirs();
-                }
-
-                File destFile = new File(videoEditorDir, filename);
-                try (InputStream in = new FileInputStream(sourceFile);
-                     OutputStream out = new FileOutputStream(destFile)) {
-                    byte[] buffer = new byte[8192];
-                    int bytesRead;
-                    while ((bytesRead = in.read(buffer)) != -1) {
-                        out.write(buffer, 0, bytesRead);
-                    }
-                    return destFile.getAbsolutePath();
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-            return null;
-        }
-        return null;
-    }
-
-    private void scanMediaFile(String filePath) {
-        if (filePath.startsWith("content://")) {
-            return;
-        }
-        try {
-            Intent mediaScanIntent = new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE);
-            File file = new File(filePath);
-            Uri contentUri = Uri.fromFile(file);
-            mediaScanIntent.setData(contentUri);
-            sendBroadcast(mediaScanIntent);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
     }
 
     private void showProgress(boolean show) {
@@ -1470,21 +967,96 @@ public class MainActivity extends AppCompatActivity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ContentValues values = new ContentValues();
             values.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
-            values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-            values.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/VideoEditor");
+            values.put(MediaStore.Video.Media.MIME_TYPE, Constants.MIME_TYPE_MP4);
+            values.put(MediaStore.Video.Media.RELATIVE_PATH,
+                    Environment.DIRECTORY_MOVIES + "/" + Constants.DIR_VIDEO_EDITOR);
             Uri uri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
             ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "w");
             targetFile = new File("/storage/emulated/0/" +
-                    Environment.DIRECTORY_MOVIES + "/VideoEditor/" + fileName);
+                    Environment.DIRECTORY_MOVIES + "/" + Constants.DIR_VIDEO_EDITOR + "/" + fileName);
             pfd.close();
         } else {
             File movies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES);
-            File dir = new File(movies, "VideoEditor");
-            if (!dir.exists()) dir.mkdirs();
+            File dir = new File(movies, Constants.DIR_VIDEO_EDITOR);
+            if (!FileUtils.ensureDirectoryExists(dir)) {
+                throw new IOException("无法创建目录: " + dir.getAbsolutePath());
+            }
             targetFile = new File(dir, fileName);
             targetFile.createNewFile();
         }
         return targetFile.getAbsolutePath();
+    }
+
+    // 辅助方法：保存到公共目录并扫描
+    private boolean saveToPublicAndScan(File sourceFile, String fileName) {
+        if (!sourceFile.exists()) {
+            Log.e(TAG, "源文件不存在: " + sourceFile.getAbsolutePath());
+            return false;
+        }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10+ 使用 MediaStore
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
+                values.put(MediaStore.Video.Media.MIME_TYPE, Constants.MIME_TYPE_MP4);
+                values.put(MediaStore.Video.Media.RELATIVE_PATH,
+                        Environment.DIRECTORY_MOVIES + "/" + Constants.DIR_VIDEO_EDITOR);
+
+                Uri uri = getContentResolver().insert(
+                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
+
+                if (uri != null) {
+                    try (InputStream in = new FileInputStream(sourceFile);
+                         OutputStream out = getContentResolver().openOutputStream(uri)) {
+                        if (out != null) {
+                            byte[] buffer = new byte[Constants.BUFFER_SIZE_8KB];
+                            int bytesRead;
+                            while ((bytesRead = in.read(buffer)) != -1) {
+                                out.write(buffer, 0, bytesRead);
+                            }
+                            out.flush();
+                            Log.d(TAG, "文件已保存到MediaStore: " + uri);
+
+                            // 触发媒体扫描
+                            VideoUtils.scanMediaFile(this, uri.toString());
+                            return true;
+                        }
+                    }
+                }
+            } else {
+                // Android 9及以下
+                File moviesDir = Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_MOVIES);
+                File videoEditorDir = new File(moviesDir, Constants.DIR_VIDEO_EDITOR);
+                if (!FileUtils.ensureDirectoryExists(videoEditorDir)) {
+                    return false;
+                }
+
+                File destFile = new File(videoEditorDir, fileName);
+                try (InputStream in = new FileInputStream(sourceFile);
+                     OutputStream out = new FileOutputStream(destFile)) {
+                    byte[] buffer = new byte[Constants.BUFFER_SIZE_8KB];
+                    int bytesRead;
+                    while ((bytesRead = in.read(buffer)) != -1) {
+                        out.write(buffer, 0, bytesRead);
+                    }
+                    out.flush();
+                }
+
+                // 扫描到媒体库
+                MediaScannerConnection.scanFile(this,
+                        new String[]{destFile.getAbsolutePath()},
+                        new String[]{Constants.MIME_TYPE_MP4}, null);
+
+                Log.d(TAG, "文件已保存到公共目录: " + destFile.getAbsolutePath());
+                return true;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "保存到公共目录失败", e);
+            return false;
+        }
+        return false;
     }
 
     @Override
