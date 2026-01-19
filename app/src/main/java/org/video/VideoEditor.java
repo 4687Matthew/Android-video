@@ -274,18 +274,18 @@ public class VideoEditor {
                 updateStatus(callback, "常规视频，使用快速分割", 20);
             }
 
-            // 3. 查找分割点附近的关键帧
+// 3. 查找分割点附近的关键帧
             updateStatus(callback, "查找最佳分割点...", 25);
             long actualSplitTimeUs = findNearestKeyframe(extractor, videoTrackIndex, splitTimeUs);
 
-            // 记录实际分割点和目标分割点的差异
+// 记录实际分割点和目标分割点的差异
             long diff = Math.abs(actualSplitTimeUs - splitTimeUs);
             Log.d(TAG, String.format("分割点: 目标=%.3fs, 实际=%.3fs, 差异=%.3fs",
                     splitTimeUs / 1000000.0,
                     actualSplitTimeUs / 1000000.0,
                     diff / 1000000.0));
 
-            // 4. 根据视频类型选择分割方案
+// 4. 根据视频类型选择分割方案
             if (isHighBFrameVideo) {
                 // 使用高B帧优化方案
                 return splitVideoHighBFrames(inputPath, outputPath1, outputPath2,
@@ -309,6 +309,61 @@ public class VideoEditor {
                 } catch (Exception e) {
                     Log.e(TAG, "释放提取器失败", e);
                 }
+            }
+        }
+    }
+
+    /**
+     * 检测是否为高B帧视频 - 优化版（无需读取数据）
+     */
+    private static boolean isHighBFrameVideo(String inputPath, int videoTrackIndex) {
+        MediaExtractor extractor = null;
+        try {
+            extractor = new MediaExtractor();
+            extractor.setDataSource(inputPath);
+            extractor.selectTrack(videoTrackIndex);
+
+            // 只分析前30秒或前500帧
+            int totalFrames = 0;
+            int bFrames = 0;
+            long analysisDuration = 30 * 1000000L; // 30秒
+
+            // 定位到开始
+            extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
+            while (totalFrames < 500) {
+                // 获取样本大小但不读取数据
+                long sampleTime = extractor.getSampleTime();
+                if (sampleTime > analysisDuration) {
+                    break;
+                }
+
+                int flags = extractor.getSampleFlags();
+                boolean isKeyframe = (flags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0;
+
+                totalFrames++;
+                if (!isKeyframe) {
+                    bFrames++;
+                }
+
+                // 前进到下一帧
+                if (!extractor.advance()) {
+                    break;
+                }
+            }
+
+            double bFrameRatio = totalFrames > 0 ? (double) bFrames / totalFrames : 0;
+            Log.d(TAG, String.format("B帧检测: 总帧数=%d, B帧数=%d, B帧比例=%.1f%%",
+                    totalFrames, bFrames, bFrameRatio * 100));
+
+            return bFrameRatio >= Constants.HIGH_BFRAME_THRESHOLD;
+
+        } catch (Exception e) {
+            Log.e(TAG, "检测B帧比例失败", e);
+            return false;
+        } finally {
+            if (extractor != null) {
+                extractor.release();
             }
         }
     }
