@@ -2,9 +2,13 @@ package org.video;
 
 import static org.video.utils.VideoUtils.convertSampleFlagsToBufferFlags;
 import static org.video.utils.VideoUtils.getVideoDurationMs;
-import static org.video.utils.VideoUtils.isHighBFrameVideo;
 
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Matrix;
 import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.media.MediaMuxer;
@@ -12,6 +16,7 @@ import android.os.Build;
 import android.util.Log;
 
 import org.video.utils.CodecUtils;
+import org.video.utils.Constants;
 import org.video.utils.FileUtils;
 import org.video.utils.TimeUtils;
 import org.video.utils.VideoUtils;
@@ -263,7 +268,7 @@ public class VideoEditor {
             updateStatus(callback, "检测视频编码特征...", 15);
             boolean isHighBFrameVideo = false;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                isHighBFrameVideo = isHighBFrameVideo(inputPath, videoTrackIndex);
+                isHighBFrameVideo = VideoUtils.isHighBFrameVideo(inputPath, videoTrackIndex);
             }
 
             if (isHighBFrameVideo) {
@@ -313,60 +318,60 @@ public class VideoEditor {
         }
     }
 
-    /**
-     * 检测是否为高B帧视频 - 优化版（无需读取数据）
-     */
-    private static boolean isHighBFrameVideo(String inputPath, int videoTrackIndex) {
-        MediaExtractor extractor = null;
-        try {
-            extractor = new MediaExtractor();
-            extractor.setDataSource(inputPath);
-            extractor.selectTrack(videoTrackIndex);
-
-            // 只分析前30秒或前500帧
-            int totalFrames = 0;
-            int bFrames = 0;
-            long analysisDuration = 30 * 1000000L; // 30秒
-
-            // 定位到开始
-            extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
-
-            while (totalFrames < 500) {
-                // 获取样本大小但不读取数据
-                long sampleTime = extractor.getSampleTime();
-                if (sampleTime > analysisDuration) {
-                    break;
-                }
-
-                int flags = extractor.getSampleFlags();
-                boolean isKeyframe = (flags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0;
-
-                totalFrames++;
-                if (!isKeyframe) {
-                    bFrames++;
-                }
-
-                // 前进到下一帧
-                if (!extractor.advance()) {
-                    break;
-                }
-            }
-
-            double bFrameRatio = totalFrames > 0 ? (double) bFrames / totalFrames : 0;
-            Log.d(TAG, String.format("B帧检测: 总帧数=%d, B帧数=%d, B帧比例=%.1f%%",
-                    totalFrames, bFrames, bFrameRatio * 100));
-
-            return bFrameRatio >= Constants.HIGH_BFRAME_THRESHOLD;
-
-        } catch (Exception e) {
-            Log.e(TAG, "检测B帧比例失败", e);
-            return false;
-        } finally {
-            if (extractor != null) {
-                extractor.release();
-            }
-        }
-    }
+//    /**
+//     * 检测是否为高B帧视频 - 优化版（无需读取数据）
+//     */
+//    private static boolean isHighBFrameVideo(String inputPath, int videoTrackIndex) {
+//        MediaExtractor extractor = null;
+//        try {
+//            extractor = new MediaExtractor();
+//            extractor.setDataSource(inputPath);
+//            extractor.selectTrack(videoTrackIndex);
+//
+//            // 只分析前30秒或前500帧
+//            int totalFrames = 0;
+//            int bFrames = 0;
+//            long analysisDuration = 30 * 1000000L; // 30秒
+//
+//            // 定位到开始
+//            extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+//
+//            while (totalFrames < 500) {
+//                // 获取样本大小但不读取数据
+//                long sampleTime = extractor.getSampleTime();
+//                if (sampleTime > analysisDuration) {
+//                    break;
+//                }
+//
+//                int flags = extractor.getSampleFlags();
+//                boolean isKeyframe = (flags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0;
+//
+//                totalFrames++;
+//                if (!isKeyframe) {
+//                    bFrames++;
+//                }
+//
+//                // 前进到下一帧
+//                if (!extractor.advance()) {
+//                    break;
+//                }
+//            }
+//
+//            double bFrameRatio = totalFrames > 0 ? (double) bFrames / totalFrames : 0;
+//            Log.d(TAG, String.format("B帧检测: 总帧数=%d, B帧数=%d, B帧比例=%.1f%%",
+//                    totalFrames, bFrames, bFrameRatio * 100));
+//
+//            return bFrameRatio >= Constants.HIGH_BFRAME_THRESHOLD;
+//
+//        } catch (Exception e) {
+//            Log.e(TAG, "检测B帧比例失败", e);
+//            return false;
+//        } finally {
+//            if (extractor != null) {
+//                extractor.release();
+//            }
+//        }
+//    }
 
     /**
      * 简化的高B帧分割方案（基于你现有代码结构）
@@ -2752,6 +2757,912 @@ public class VideoEditor {
         long calculatedInterval = duration / targetKeyFrames;
         sampleInterval = Math.max(sampleInterval, calculatedInterval);
         return sampleInterval;
+    }
+
+    /**
+     * 设置视频封面（完整修复版）- 修复复用器启动和编码器格式问题
+     */
+    public static boolean setVideoCover(String inputPath, String outputPath,
+                                        Bitmap coverBitmap,
+                                        MainActivity.ProgressCallback callback) {
+        MediaExtractor extractor = null;
+        MediaMuxer muxer = null;
+        MediaCodec videoDecoder = null;
+        MediaCodec videoEncoder = null;
+
+        int muxerVideoTrack = -1;
+        int muxerAudioTrack = -1;
+        MediaFormat encoderOutputFormat = null;
+        boolean muxerStarted = false;
+
+        try {
+            updateStatus(callback, "开始设置视频封面...", 0);
+
+            // 1. 验证输入文件
+            if (!VideoUtils.isValidVideoFile(inputPath)) {
+                updateStatus(callback, "错误：输入文件不存在或为空", 0);
+                Log.e(TAG, "无效的输入文件: " + inputPath);
+                return false;
+            }
+
+            if (coverBitmap == null || coverBitmap.isRecycled()) {
+                updateStatus(callback, "错误：封面图片无效", 0);
+                Log.e(TAG, "无效的封面图片");
+                return false;
+            }
+
+            // 2. 分析原始视频
+            updateStatus(callback, "分析视频信息...", 10);
+            extractor = new MediaExtractor();
+            try {
+                extractor.setDataSource(inputPath);
+            } catch (Exception e) {
+                updateStatus(callback, "无法读取视频文件: " + e.getMessage(), 0);
+                Log.e(TAG, "设置数据源失败", e);
+                return false;
+            }
+
+            int videoTrackIndex = -1;
+            int audioTrackIndex = -1;
+            MediaFormat videoFormat = null;
+            MediaFormat audioFormat = null;
+            long videoDuration = 0;
+
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                MediaFormat format = extractor.getTrackFormat(i);
+                String mime = format.getString(MediaFormat.KEY_MIME);
+
+                if (mime != null && mime.startsWith("video/")) {
+                    videoTrackIndex = i;
+                    videoFormat = format;
+                    if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                        videoDuration = format.getLong(MediaFormat.KEY_DURATION);
+                    }
+                    Log.d(TAG, "找到视频轨道: " + format);
+                } else if (mime != null && mime.startsWith("audio/")) {
+                    audioTrackIndex = i;
+                    audioFormat = format;
+                    Log.d(TAG, "找到音频轨道: " + format);
+                }
+            }
+
+            if (videoFormat == null) {
+                updateStatus(callback, "错误：未找到视频轨道", 0);
+                Log.e(TAG, "未找到视频轨道");
+                return false;
+            }
+
+            // 3. 获取视频参数
+            int width = videoFormat.getInteger(MediaFormat.KEY_WIDTH);
+            int height = videoFormat.getInteger(MediaFormat.KEY_HEIGHT);
+            int frameRate = videoFormat.containsKey(MediaFormat.KEY_FRAME_RATE)
+                    ? videoFormat.getInteger(MediaFormat.KEY_FRAME_RATE) : Constants.DEFAULT_FRAME_RATE;
+            int bitrate = videoFormat.containsKey(MediaFormat.KEY_BIT_RATE)
+                    ? videoFormat.getInteger(MediaFormat.KEY_BIT_RATE) : Constants.DEFAULT_BITRATE;
+            String videoMime = videoFormat.getString(MediaFormat.KEY_MIME);
+
+            updateStatus(callback, String.format("视频信息: %dx%d, %dfps, 码率: %dkbps",
+                    width, height, frameRate, bitrate / 1000), 15);
+
+            Log.d(TAG, String.format("视频参数: %dx%d, %dfps, 码率%dkbps, MIME: %s",
+                    width, height, frameRate, bitrate / 1000, videoMime));
+
+            // 4. 调整封面尺寸
+            updateStatus(callback, "处理封面图片...", 20);
+            Bitmap resizedCover = resizeAndCropBitmap(coverBitmap, width, height);
+            if (resizedCover == null) {
+                updateStatus(callback, "封面图片处理失败", 0);
+                Log.e(TAG, "无法调整封面尺寸");
+                return false;
+            }
+
+            // 5. 创建输出文件
+            updateStatus(callback, "准备输出文件...", 25);
+            try {
+                muxer = new MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            } catch (Exception e) {
+                updateStatus(callback, "创建输出文件失败: " + e.getMessage(), 0);
+                Log.e(TAG, "创建MediaMuxer失败", e);
+                return false;
+            }
+
+            // 6. 创建视频编码器（使用原始视频参数）
+            updateStatus(callback, "创建视频编码器...", 30);
+
+            String encoderMime = videoMime;
+            // 如果HEVC不可用，降级到AVC
+            if (encoderMime.equals(Constants.MIME_TYPE_HEVC) && !CodecUtils.isHevcEncoderSupported()) {
+                encoderMime = Constants.MIME_TYPE_AVC;
+                Log.w(TAG, "HEVC编码器不可用，降级到AVC");
+            }
+
+            MediaFormat encoderFormat = MediaFormat.createVideoFormat(encoderMime, width, height);
+            encoderFormat.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
+            encoderFormat.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate);
+            encoderFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, Constants.I_FRAME_INTERVAL_SECONDS);
+            encoderFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
+
+            // 设置编码器参数
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                encoderFormat.setInteger(MediaFormat.KEY_BITRATE_MODE,
+                        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
+            }
+
+            try {
+                videoEncoder = MediaCodec.createEncoderByType(encoderMime);
+                videoEncoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                videoEncoder.start();
+                Log.d(TAG, "视频编码器创建成功: " + encoderMime);
+            } catch (Exception e) {
+                updateStatus(callback, "创建编码器失败: " + e.getMessage(), 0);
+                Log.e(TAG, "创建视频编码器失败", e);
+                return false;
+            }
+
+            // 7. 创建视频解码器
+            try {
+                videoDecoder = MediaCodec.createDecoderByType(videoMime);
+                videoDecoder.configure(videoFormat, null, null, 0);
+                videoDecoder.start();
+                Log.d(TAG, "视频解码器创建成功: " + videoMime);
+            } catch (Exception e) {
+                updateStatus(callback, "创建解码器失败: " + e.getMessage(), 0);
+                Log.e(TAG, "创建视频解码器失败", e);
+                return false;
+            }
+
+            // 8. 先添加音频轨道（如果存在）
+            if (audioFormat != null) {
+                muxerAudioTrack = muxer.addTrack(audioFormat);
+                Log.d(TAG, "添加音频轨道到复用器，索引: " + muxerAudioTrack);
+            }
+
+            // 9. 编码封面帧并获取输出格式
+            updateStatus(callback, "编码封面帧...", 35);
+
+            // 首先获取编码器的输出格式（必须在提交数据前获取）
+            MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+            long startTime = System.currentTimeMillis();
+
+            // 等待编码器输出格式变更
+            while (encoderOutputFormat == null &&
+                    System.currentTimeMillis() - startTime < Constants.DEFAULT_TIMEOUT_MS) {
+                int encoderStatus = videoEncoder.dequeueOutputBuffer(bufferInfo, Constants.TIMEOUT_US);
+
+                if (encoderStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    encoderOutputFormat = videoEncoder.getOutputFormat();
+                    Log.d(TAG, "获取到编码器输出格式: " + encoderOutputFormat);
+                } else if (encoderStatus == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    // 没有输出可用，提交一个空帧以触发格式变更
+                    int inputIndex = videoEncoder.dequeueInputBuffer(Constants.TIMEOUT_US);
+                    if (inputIndex >= 0) {
+                        videoEncoder.queueInputBuffer(inputIndex, 0, 0, 0,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                        Log.d(TAG, "提交空帧以触发格式变更");
+                    }
+                }
+
+                if (encoderOutputFormat == null) {
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+            }
+
+            if (encoderOutputFormat == null) {
+                Log.e(TAG, "无法获取编码器输出格式");
+                return false;
+            }
+
+            // 添加视频轨道到复用器
+            muxerVideoTrack = muxer.addTrack(encoderOutputFormat);
+            Log.d(TAG, "添加视频轨道到复用器，索引: " + muxerVideoTrack);
+
+            // 启动复用器
+            muxer.start();
+            muxerStarted = true;
+            Log.d(TAG, "复用器已启动，视频轨道: " + muxerVideoTrack + ", 音频轨道: " + muxerAudioTrack);
+
+            // 10. 编码封面帧并写入复用器
+            updateStatus(callback, "生成封面帧...", 40);
+            boolean coverEncoded = encodeCoverFrame(videoEncoder, resizedCover,
+                    width, height, frameRate,
+                    muxer, muxerVideoTrack, callback);
+
+            if (!coverEncoded) {
+                updateStatus(callback, "封面编码失败", 0);
+                Log.e(TAG, "封面帧编码失败");
+                return false;
+            }
+
+            // 回收封面图片
+            if (!resizedCover.isRecycled()) {
+                resizedCover.recycle();
+            }
+
+            // 11. 处理原始视频内容（重新编码）
+            updateStatus(callback, "处理原始视频内容...", 45);
+
+            // 选择视频轨道
+            extractor.selectTrack(videoTrackIndex);
+            extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
+            boolean success = reencodeVideoWithCover(extractor, videoDecoder, videoEncoder,
+                    muxer, muxerVideoTrack, muxerAudioTrack,
+                    videoDuration, frameRate, callback);
+
+            // 12. 处理音频轨道（如果有）
+            if (success && audioTrackIndex != -1 && muxerAudioTrack != -1) {
+                updateStatus(callback, "处理音频轨道...", 90);
+                success = copyAudioTrack(extractor, audioTrackIndex, muxer, muxerAudioTrack, frameRate);
+            }
+
+            // 13. 完成
+            if (success) {
+                updateStatus(callback, "正在保存文件...", 98);
+
+                // 发送编码结束标志
+                if (videoEncoder != null) {
+                    try {
+                        int inputIndex = videoEncoder.dequeueInputBuffer(Constants.TIMEOUT_US);
+                        if (inputIndex >= 0) {
+                            videoEncoder.queueInputBuffer(inputIndex, 0, 0, 0,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                            Log.d(TAG, "发送编码结束标志");
+                        }
+
+                        // 等待所有输出完成
+                        while (true) {
+                            int encoderStatus = videoEncoder.dequeueOutputBuffer(bufferInfo, Constants.TIMEOUT_US);
+                            if (encoderStatus >= 0) {
+                                if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                                    Log.d(TAG, "编码器输出结束");
+                                    break;
+                                }
+                                videoEncoder.releaseOutputBuffer(encoderStatus, false);
+                            } else if (encoderStatus == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                                break;
+                            }
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "发送编码结束标志失败", e);
+                    }
+                }
+
+                try {
+                    if (muxer != null && muxerStarted) {
+                        muxer.stop();
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "停止复用器失败", e);
+                }
+
+                // 验证输出文件
+                File outputFile = new File(outputPath);
+                if (outputFile.exists() && outputFile.length() > 0) {
+                    long outputSize = outputFile.length();
+                    updateStatus(callback, String.format("封面设置完成！文件大小: %s",
+                            FileUtils.getFileSizeDescription(outputPath)), 100);
+                    Log.d(TAG, String.format("封面设置完成: 输入=%s, 输出=%s, 大小=%s",
+                            inputPath, outputPath, FileUtils.getFileSizeDescription(outputPath)));
+                    return true;
+                } else {
+                    updateStatus(callback, "输出文件创建失败", 0);
+                    return false;
+                }
+            } else {
+                updateStatus(callback, "处理视频内容失败", 0);
+                return false;
+            }
+
+        } catch (Exception e) {
+            updateStatus(callback, "设置封面失败: " + e.getMessage(), 0);
+            Log.e(TAG, "setVideoCover error", e);
+            return false;
+        } finally {
+            // 清理资源
+            if (videoEncoder != null) {
+                try {
+                    videoEncoder.stop();
+                    videoEncoder.release();
+                } catch (Exception e) {
+                    Log.e(TAG, "释放编码器失败", e);
+                }
+            }
+
+            if (videoDecoder != null) {
+                try {
+                    videoDecoder.stop();
+                    videoDecoder.release();
+                } catch (Exception e) {
+                    Log.e(TAG, "释放解码器失败", e);
+                }
+            }
+
+            if (muxer != null) {
+                try {
+                    if (muxerStarted) {
+                        try {
+                            muxer.stop();
+                        } catch (Exception e) {
+                            Log.e(TAG, "停止复用器失败", e);
+                        }
+                    }
+                    muxer.release();
+                } catch (Exception e) {
+                    Log.e(TAG, "释放复用器失败", e);
+                }
+            }
+
+            if (extractor != null) {
+                try {
+                    extractor.release();
+                } catch (Exception e) {
+                    Log.e(TAG, "释放提取器失败", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * 编码封面帧（修复版）- 直接写入复用器
+     */
+    private static boolean encodeCoverFrame(MediaCodec encoder, Bitmap cover,
+                                            int width, int height, int frameRate,
+                                            MediaMuxer muxer, int muxerVideoTrack,
+                                            MainActivity.ProgressCallback callback) {
+        try {
+            updateStatus(callback, "将封面转换为YUV格式...", -1);
+
+            // 1. 将Bitmap转换为YUV420格式
+            byte[] yuvData = bitmapToYuv420(cover, width, height);
+            if (yuvData == null) {
+                Log.e(TAG, "YUV数据转换失败");
+                return false;
+            }
+
+            // 2. 获取编码器输入缓冲区
+            int inputBufferIndex = -1;
+            long startTime = System.currentTimeMillis();
+
+            while (inputBufferIndex < 0 &&
+                    System.currentTimeMillis() - startTime < Constants.DEFAULT_TIMEOUT_MS) {
+                inputBufferIndex = encoder.dequeueInputBuffer(Constants.TIMEOUT_US);
+                if (inputBufferIndex < 0) {
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+            }
+
+            if (inputBufferIndex < 0) {
+                Log.e(TAG, "获取编码器输入缓冲区超时");
+                return false;
+            }
+
+            // 3. 输入YUV数据到编码器
+            ByteBuffer inputBuffer = encoder.getInputBuffer(inputBufferIndex);
+            if (inputBuffer == null) {
+                Log.e(TAG, "获取编码器输入缓冲区失败");
+                return false;
+            }
+
+            inputBuffer.clear();
+            inputBuffer.put(yuvData);
+
+            // 第一帧必须是关键帧，时间戳为0
+            int flags = MediaCodec.BUFFER_FLAG_KEY_FRAME;
+            long presentationTimeUs = 0;
+
+            encoder.queueInputBuffer(inputBufferIndex, 0, yuvData.length,
+                    presentationTimeUs, flags);
+
+            Log.d(TAG, "封面帧已提交编码，大小: " + yuvData.length + " bytes");
+
+            // 4. 等待封面帧编码完成并写入复用器
+            updateStatus(callback, "等待编码器处理封面帧...", -1);
+            MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+            boolean coverWritten = false;
+            startTime = System.currentTimeMillis();
+
+            while (!coverWritten &&
+                    System.currentTimeMillis() - startTime < Constants.DEFAULT_TIMEOUT_MS) {
+                int encoderStatus = encoder.dequeueOutputBuffer(bufferInfo, Constants.TIMEOUT_US);
+
+                if (encoderStatus >= 0) {
+                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        // 编码配置信息，释放但不写入
+                        encoder.releaseOutputBuffer(encoderStatus, false);
+                        continue;
+                    }
+
+                    if (bufferInfo.size > 0) {
+                        // 封面帧编码完成，写入复用器
+                        ByteBuffer encodedData = encoder.getOutputBuffer(encoderStatus);
+                        if (encodedData != null) {
+                            encodedData.position(bufferInfo.offset);
+                            encodedData.limit(bufferInfo.offset + bufferInfo.size);
+
+                            try {
+                                muxer.writeSampleData(muxerVideoTrack, encodedData, bufferInfo);
+                                coverWritten = true;
+                                Log.d(TAG, "封面帧写入完成，大小: " + bufferInfo.size + " bytes");
+                            } catch (Exception e) {
+                                Log.e(TAG, "写入封面帧失败: " + e.getMessage(), e);
+                                encoder.releaseOutputBuffer(encoderStatus, false);
+                                return false;
+                            }
+                        }
+                    }
+
+                    encoder.releaseOutputBuffer(encoderStatus, false);
+
+                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        Log.d(TAG, "编码器输出结束");
+                        break;
+                    }
+                } else if (encoderStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    // 编码器输出格式已更改，继续等待实际帧数据
+                    Log.d(TAG, "编码器输出格式变更");
+                } else if (encoderStatus == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    // 没有输出可用，稍等
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+            }
+
+            if (!coverWritten) {
+                Log.e(TAG, "等待封面帧编码完成超时");
+                return false;
+            }
+
+            return true;
+
+        } catch (Exception e) {
+            Log.e(TAG, "编码封面帧失败", e);
+            return false;
+        }
+    }
+
+    /**
+     * 重新编码视频（封面之后的内容）- 修复版
+     */
+    private static boolean reencodeVideoWithCover(MediaExtractor extractor,
+                                                  MediaCodec decoder, MediaCodec encoder,
+                                                  MediaMuxer muxer, int muxerVideoTrack, int muxerAudioTrack,
+                                                  long videoDuration, int frameRate,
+                                                  MainActivity.ProgressCallback callback) {
+
+        try {
+            updateStatus(callback, "开始重新编码视频内容...", 50);
+
+            MediaCodec.BufferInfo decoderInfo = new MediaCodec.BufferInfo();
+            MediaCodec.BufferInfo encoderInfo = new MediaCodec.BufferInfo();
+
+            boolean inputEos = false;
+            boolean outputEos = false;
+
+            // 记录当前时间戳（从封面帧之后开始）
+            long currentPts = 1000000L / frameRate; // 封面帧显示一帧的时间
+            int totalFrames = 0;
+            long lastProgressUpdateTime = System.currentTimeMillis();
+
+            while (!outputEos) {
+                // 1. 向解码器输入数据
+                if (!inputEos) {
+                    int inputIndex = decoder.dequeueInputBuffer(Constants.TIMEOUT_US);
+                    if (inputIndex >= 0) {
+                        ByteBuffer inputBuffer = decoder.getInputBuffer(inputIndex);
+                        inputBuffer.clear();
+
+                        int sampleSize = extractor.readSampleData(inputBuffer, 0);
+                        if (sampleSize < 0) {
+                            // 输入结束
+                            decoder.queueInputBuffer(inputIndex, 0, 0, 0,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                            inputEos = true;
+                            Log.d(TAG, "解码器输入结束");
+                        } else {
+                            long presentationTimeUs = extractor.getSampleTime();
+                            decoder.queueInputBuffer(inputIndex, 0, sampleSize,
+                                    presentationTimeUs, 0);
+                            extractor.advance();
+                        }
+                    }
+                }
+
+                // 2. 从解码器获取输出
+                int decoderIndex = decoder.dequeueOutputBuffer(decoderInfo, Constants.TIMEOUT_US);
+                if (decoderIndex >= 0) {
+                    // 解码器输出一帧
+                    if ((decoderInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        // 解码器输出结束，通知编码器
+                        int encoderInputIndex = encoder.dequeueInputBuffer(Constants.TIMEOUT_US);
+                        if (encoderInputIndex >= 0) {
+                            encoder.queueInputBuffer(encoderInputIndex, 0, 0, 0,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                            Log.d(TAG, "向编码器发送结束标志");
+                        }
+                    } else if (decoderInfo.size > 0) {
+                        // 将解码后的帧送入编码器
+                        int encoderInputIndex = encoder.dequeueInputBuffer(Constants.TIMEOUT_US);
+                        if (encoderInputIndex >= 0) {
+                            ByteBuffer encoderInputBuffer = encoder.getInputBuffer(encoderInputIndex);
+                            encoderInputBuffer.clear();
+
+                            ByteBuffer decoderOutputBuffer = decoder.getOutputBuffer(decoderIndex);
+                            if (decoderOutputBuffer != null) {
+                                decoderOutputBuffer.position(decoderInfo.offset);
+                                decoderOutputBuffer.limit(decoderInfo.offset + decoderInfo.size);
+                                encoderInputBuffer.put(decoderOutputBuffer);
+
+                                // 使用递增的时间戳
+                                encoder.queueInputBuffer(encoderInputIndex, 0,
+                                        decoderInfo.size, currentPts, 0);
+
+                                // 下一帧时间戳（根据帧率）
+                                currentPts += (1000000L / frameRate);
+                            }
+                        }
+                    }
+
+                    decoder.releaseOutputBuffer(decoderIndex, false);
+                }
+
+                // 3. 从编码器获取输出并写入文件
+                int encoderIndex = encoder.dequeueOutputBuffer(encoderInfo, Constants.TIMEOUT_US);
+                if (encoderIndex >= 0) {
+                    if ((encoderInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        encoder.releaseOutputBuffer(encoderIndex, false);
+                        continue;
+                    }
+
+                    if (encoderInfo.size > 0) {
+                        ByteBuffer encodedData = encoder.getOutputBuffer(encoderIndex);
+                        if (encodedData != null) {
+                            encodedData.position(encoderInfo.offset);
+                            encodedData.limit(encoderInfo.offset + encoderInfo.size);
+
+                            try {
+                                muxer.writeSampleData(muxerVideoTrack, encodedData, encoderInfo);
+                                totalFrames++;
+
+                                // 更新进度
+                                long currentTime = System.currentTimeMillis();
+                                if (currentTime - lastProgressUpdateTime > Constants.PROGRESS_UPDATE_INTERVAL_MS ||
+                                        totalFrames % 30 == 0) {
+                                    if (videoDuration > 0) {
+                                        double progress = 50 + ((double) encoderInfo.presentationTimeUs / videoDuration * 35);
+                                        updateStatus(callback,
+                                                String.format("已重新编码 %d 帧", totalFrames),
+                                                Math.min((int) progress, 85));
+                                    } else {
+                                        updateStatus(callback, String.format("已重新编码 %d 帧", totalFrames), -1);
+                                    }
+                                    lastProgressUpdateTime = currentTime;
+                                }
+                            } catch (Exception e) {
+                                Log.e(TAG, "写入重新编码的视频帧失败: " + e.getMessage(), e);
+                            }
+                        }
+                    }
+
+                    encoder.releaseOutputBuffer(encoderIndex, false);
+
+                    if ((encoderInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        outputEos = true;
+                        Log.d(TAG, "重新编码完成，共 " + totalFrames + " 帧");
+                    }
+                } else if (encoderIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    // 编码器输出格式已更改（应该已经在封面帧编码时处理了）
+                    Log.d(TAG, "编码器输出格式变更（重新编码阶段）");
+                } else if (encoderIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    // 没有输出可用，继续循环
+                    if (inputEos) {
+                        // 如果输入已结束，但没有输出，可能编码器还在处理
+                        try {
+                            Thread.sleep(5);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            Log.d(TAG, "重新编码完成: " + totalFrames + " 帧");
+            updateStatus(callback, String.format("重新编码完成: %d帧", totalFrames), 85);
+            return totalFrames > 0;
+
+        } catch (Exception e) {
+            Log.e(TAG, "重新编码视频失败", e);
+            return false;
+        }
+    }
+
+    /**
+     * 复制音频轨道 - 修复时间戳对齐
+     */
+    private static boolean copyAudioTrack(MediaExtractor extractor, int audioTrackIndex,
+                                          MediaMuxer muxer, int muxerAudioTrack, int frameRate) {
+        try {
+            // 保存当前轨道选择状态
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                extractor.unselectTrack(i);
+            }
+
+            extractor.selectTrack(audioTrackIndex);
+            extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+
+            ByteBuffer buffer = ByteBuffer.allocate(Constants.BUFFER_SIZE_512KB);
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+
+            long firstPts = -1;
+            int audioFrameCount = 0;
+
+            // 音频起始时间与视频对齐（封面帧之后）
+            long videoFrameDuration = 1000000L / frameRate; // 视频一帧的时长
+            long audioStartOffset = videoFrameDuration; // 音频从封面帧后开始
+
+            while (true) {
+                buffer.clear();
+                int sampleSize = extractor.readSampleData(buffer, 0);
+                if (sampleSize < 0) break;
+
+                long pts = extractor.getSampleTime();
+                if (firstPts == -1) {
+                    firstPts = pts;
+                }
+
+                buffer.position(0);
+                buffer.limit(sampleSize);
+
+                // 音频时间戳从封面之后开始
+                long newPts = audioStartOffset + (pts - firstPts);
+                info.set(0, sampleSize, newPts,
+                        convertSampleFlagsToBufferFlags(extractor.getSampleFlags()));
+
+                try {
+                    muxer.writeSampleData(muxerAudioTrack, buffer, info);
+                    audioFrameCount++;
+                } catch (Exception e) {
+                    Log.e(TAG, "写入音频帧失败", e);
+                    break;
+                }
+
+                if (!extractor.advance()) {
+                    break;
+                }
+            }
+
+            Log.d(TAG, "音频复制完成: " + audioFrameCount + " 帧");
+            return audioFrameCount > 0;
+
+        } catch (Exception e) {
+            Log.e(TAG, "复制音频轨道失败", e);
+            return false;
+        }
+    }
+
+    /**
+     * 转换样本标志为缓冲区标志
+     */
+    private static int convertSampleFlagsToBufferFlags(int sampleFlags) {
+        int flags = 0;
+        if ((sampleFlags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+            flags |= MediaCodec.BUFFER_FLAG_KEY_FRAME;
+        }
+        return flags;
+    }
+
+    /**
+     * 调整和裁剪Bitmap以匹配视频尺寸
+     */
+    private static Bitmap resizeAndCropBitmap(Bitmap original, int targetWidth, int targetHeight) {
+        if (original == null || original.isRecycled()) {
+            return null;
+        }
+
+        int originalWidth = original.getWidth();
+        int originalHeight = original.getHeight();
+
+        // 如果尺寸完全匹配，直接返回副本
+        if (originalWidth == targetWidth && originalHeight == targetHeight) {
+            return original.copy(Bitmap.Config.ARGB_8888, true);
+        }
+
+        // 计算缩放比例，保持宽高比，填充整个目标区域（可能裁剪）
+        float widthRatio = (float) targetWidth / originalWidth;
+        float heightRatio = (float) targetHeight / originalHeight;
+        float scale = Math.max(widthRatio, heightRatio);
+
+        int scaledWidth = Math.round(originalWidth * scale);
+        int scaledHeight = Math.round(originalHeight * scale);
+
+        Log.d(TAG, String.format("调整Bitmap: %dx%d -> %dx%d (缩放比例: %.2f)",
+                originalWidth, originalHeight, scaledWidth, scaledHeight, scale));
+
+        // 创建缩放后的Bitmap
+        Matrix matrix = new Matrix();
+        matrix.postScale(scale, scale);
+
+        Bitmap scaledBitmap;
+        try {
+            scaledBitmap = Bitmap.createBitmap(original, 0, 0,
+                    originalWidth, originalHeight, matrix, true);
+        } catch (Exception e) {
+            Log.e(TAG, "缩放Bitmap失败", e);
+            return null;
+        }
+
+        // 如果需要裁剪
+        if (scaledWidth > targetWidth || scaledHeight > targetHeight) {
+            int startX = Math.max(0, (scaledWidth - targetWidth) / 2);
+            int startY = Math.max(0, (scaledHeight - targetHeight) / 2);
+
+            // 确保裁剪区域在边界内
+            int cropWidth = Math.min(targetWidth, scaledWidth - startX);
+            int cropHeight = Math.min(targetHeight, scaledHeight - startY);
+
+            Log.d(TAG, String.format("裁剪Bitmap: 起始(%d,%d), 尺寸%dx%d",
+                    startX, startY, cropWidth, cropHeight));
+
+            try {
+                Bitmap croppedBitmap = Bitmap.createBitmap(scaledBitmap,
+                        startX, startY, cropWidth, cropHeight);
+                scaledBitmap.recycle();
+                return croppedBitmap;
+            } catch (Exception e) {
+                Log.e(TAG, "裁剪Bitmap失败", e);
+                scaledBitmap.recycle();
+                return null;
+            }
+        } else {
+            // 不需要裁剪，但可能需要添加黑边
+            if (scaledWidth < targetWidth || scaledHeight < targetHeight) {
+                Bitmap paddedBitmap = Bitmap.createBitmap(targetWidth, targetHeight,
+                        Bitmap.Config.ARGB_8888);
+
+                Canvas canvas = new Canvas(paddedBitmap);
+                canvas.drawColor(Color.BLACK);
+
+                int left = (targetWidth - scaledWidth) / 2;
+                int top = (targetHeight - scaledHeight) / 2;
+                canvas.drawBitmap(scaledBitmap, left, top, null);
+
+                scaledBitmap.recycle();
+                return paddedBitmap;
+            } else {
+                return scaledBitmap;
+            }
+        }
+    }
+
+    /**
+     * 将Bitmap转换为YUV420格式
+     */
+    private static byte[] bitmapToYuv420(Bitmap bitmap, int width, int height) {
+        if (bitmap == null || bitmap.isRecycled()) {
+            Log.e(TAG, "Bitmap无效");
+            return null;
+        }
+
+        // 确保Bitmap尺寸正确
+        if (bitmap.getWidth() != width || bitmap.getHeight() != height) {
+            Log.w(TAG, String.format("Bitmap尺寸不匹配: %dx%d -> %dx%d",
+                    bitmap.getWidth(), bitmap.getHeight(), width, height));
+            Bitmap resized = Bitmap.createScaledBitmap(bitmap, width, height, true);
+            bitmap.recycle();
+            bitmap = resized;
+        }
+
+        // 分配YUV缓冲区
+        int ySize = width * height;
+        int uvSize = ySize / 2; // YUV420: Y占1/2，U和V各占1/4
+        byte[] yuvData = new byte[ySize + uvSize];
+
+        try {
+            int[] argb = new int[width * height];
+            bitmap.getPixels(argb, 0, width, 0, 0, width, height);
+
+            int yIndex = 0;
+            int uvIndex = ySize;
+
+            // 转换每一行
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    int pixel = argb[y * width + x];
+
+                    // 提取RGB分量
+                    int r = (pixel >> 16) & 0xFF;
+                    int g = (pixel >> 8) & 0xFF;
+                    int b = pixel & 0xFF;
+
+                    // 计算Y分量（亮度）
+                    // BT.601标准公式: Y = 0.299R + 0.587G + 0.114B
+                    int yValue = (int) (0.299 * r + 0.587 * g + 0.114 * b);
+                    yuvData[yIndex++] = (byte) (Math.max(0, Math.min(255, yValue)));
+
+                    // 每隔2x2像素计算一次UV分量
+                    if (y % 2 == 0 && x % 2 == 0) {
+                        // 计算2x2区域的平均RGB
+                        int rSum = 0, gSum = 0, bSum = 0;
+                        int count = 0;
+
+                        for (int dy = 0; dy < 2 && y + dy < height; dy++) {
+                            for (int dx = 0; dx < 2 && x + dx < width; dx++) {
+                                int p = argb[(y + dy) * width + (x + dx)];
+                                rSum += (p >> 16) & 0xFF;
+                                gSum += (p >> 8) & 0xFF;
+                                bSum += p & 0xFF;
+                                count++;
+                            }
+                        }
+
+                        if (count > 0) {
+                            int rAvg = rSum / count;
+                            int gAvg = gSum / count;
+                            int bAvg = bSum / count;
+
+                            // 计算U分量（色度）
+                            // U = -0.147R - 0.289G + 0.436B + 128
+                            int uValue = (int) (-0.147 * rAvg - 0.289 * gAvg + 0.436 * bAvg + 128);
+                            yuvData[uvIndex++] = (byte) (Math.max(0, Math.min(255, uValue)));
+
+                            // 计算V分量（色度）
+                            // V = 0.615R - 0.515G - 0.100B + 128
+                            int vValue = (int) (0.615 * rAvg - 0.515 * gAvg - 0.100 * bAvg + 128);
+                            yuvData[uvIndex++] = (byte) (Math.max(0, Math.min(255, vValue)));
+                        }
+                    }
+                }
+            }
+
+            Log.d(TAG, String.format("YUV转换完成: YUV大小=%d, 原始ARGB=%d",
+                    yuvData.length, argb.length * 4));
+            return yuvData;
+
+        } catch (Exception e) {
+            Log.e(TAG, "YUV转换异常", e);
+            return null;
+        }
+    }
+
+    /**
+     * 提取视频封面（简单版本）
+     * 只提取封面图片，不修改视频
+     */
+    public static Bitmap extractVideoCover(String videoPath, long timeMs,
+                                           MainActivity.ProgressCallback callback) {
+        try {
+            updateStatus(callback, "正在提取封面...", 0);
+
+            Bitmap cover = VideoUtils.extractCoverFromVideo(videoPath, timeMs);
+
+            if (cover != null) {
+                updateStatus(callback, "封面提取成功", 100);
+                return cover;
+            } else {
+                updateStatus(callback, "封面提取失败", 0);
+                return null;
+            }
+
+        } catch (Exception e) {
+            updateStatus(callback, "提取封面出错: " + e.getMessage(), 0);
+            Log.e(TAG, "extractVideoCover error", e);
+            return null;
+        }
     }
 
     /**

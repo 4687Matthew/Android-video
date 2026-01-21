@@ -1,7 +1,5 @@
 package org.video.utils;
 
-import org.video.Constants;
-
 import java.util.Locale;
 
 /**

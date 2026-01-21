@@ -6,8 +6,6 @@ import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.util.Log;
 
-import org.video.Constants;
-
 import java.util.ArrayList;
 import java.util.List;
 

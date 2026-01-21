@@ -8,8 +8,6 @@ import android.os.Environment;
 import android.provider.MediaStore;
 import android.util.Log;
 
-import org.video.Constants;
-
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;

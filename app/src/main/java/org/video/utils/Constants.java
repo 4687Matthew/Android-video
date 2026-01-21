@@ -1,4 +1,4 @@
-package org.video;
+package org.video.utils;
 
 import android.os.Build;
 
@@ -125,5 +125,32 @@ public class Constants {
     public static final String DATE_FORMAT_FILENAME = "yyyyMMdd_HHmmss";
     public static final String TIME_FORMAT_HMS = "%02d:%02d:%02d";
     public static final String TIME_FORMAT_MS = "%02d:%02d";
+
+    // 封面相关常量
+    public static final String SUFFIX_WITH_COVER = "_with_cover";
+    public static final String MIME_TYPE_IMAGE = "image/*";
+    public static final int REQUEST_CODE_SELECT_COVER_IMAGE = 1003;
+
+
+    // 封面提取时间（毫秒）
+    public static final long DEFAULT_COVER_TIME_MS = 1000;
+    public static final long MIN_COVER_TIME_MS = 0;
+
+    // 封面图片格式
+    public static final String FILE_EXT_JPEG = ".jpg";
+    public static final String FILE_EXT_PNG = ".png";
+
+    // 封面尺寸
+    public static final int COVER_WIDTH = 1280;
+    public static final int COVER_HEIGHT = 720;
+    public static final int COVER_QUALITY = 90; // JPEG质量 1-100
+
+    // 预览封面
+    public static final String PREFIX_COVER_PREVIEW = "cover_preview_";
+
+    // 视频相关
+    public static final int DEFAULT_BITRATE = 2000000; // 2Mbps
+    public static final int I_FRAME_INTERVAL_SECONDS = 1; // I帧间隔
+    public static final int DEFAULT_TIMEOUT_MS = 10000; // 10秒超时
 
 }

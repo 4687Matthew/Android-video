@@ -1,21 +1,138 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- 应用名称 -->
     <string name="app_name">视频编辑器</string>
-    <string name="select_video">选择视频</string>
-    <string name="crop_video">裁剪视频</string>
-    <string name="split_video">分割视频</string>
-    <string name="merge_videos">合并视频</string>
-    <string name="speed_up">快放</string>
-    <string name="speed_down">慢放</string>
-    <string name="processing">处理中...</string>
-    <string name="success">处理成功</string>
-    <string name="error">处理失败</string>
-    <string name="start_time">开始时间(秒)</string>
-    <string name="end_time">结束时间(秒)</string>
-    <string name="split_time">分割时间(秒)</string>
-    <string name="speed_factor">速度倍数</string>
-    <string name="process">处理</string>
-    <string name="select_second_video">选择第二个视频</string>
-    <string name="video_info">获取视频信息</string>
-</resources>
 
+    <!-- 通用文本 -->
+    <string name="not_selected">未选择</string>
+    <string name="completed">完成</string>
+    <string name="failed">失败</string>
+    <string name="seconds">秒</string>
+    <string name="size">大小</string>
+    <string name="duration">时长</string>
+
+    <!-- 视频选择区域 -->
+    <string name="video_selection">视频选择</string>
+    <string name="select_video">选择视频</string>
+    <string name="no_video_selected">未选择视频</string>
+    <string name="video_info">获取视频信息</string>
+
+    <!-- 视频压缩区域 -->
+    <string name="video_compression">视频压缩</string>
+    <string name="serial_compression">串行压缩</string>
+    <string name="parallel_compression">并行压缩</string>
+    <string name="bitrate_reduction">降低码率</string>
+
+    <!-- 封面设置区域 -->
+    <string name="cover_settings">封面设置</string>
+    <string name="cover_time_hint">封面时间(秒)</string>
+    <string name="extract_cover">提取</string>
+    <string name="select_cover_image">选择封面图片</string>
+    <string name="set_cover_to_video">设置封面到视频</string>
+    <string name="save_cover">保存封面</string>
+    <string name="cover_preview">封面预览</string>
+    <string name="no_cover_extracted">未提取封面</string>
+    <string name="cover_size">封面尺寸</string>
+
+    <!-- 视频编辑区域 -->
+    <string name="video_editing">视频编辑</string>
+    <string name="crop_video_title">裁剪视频</string>
+    <string name="crop_video_button">裁剪视频</string>
+    <string name="start_time_hint">开始时间(秒)</string>
+    <string name="end_time_hint">结束时间(秒)</string>
+
+    <string name="split_video_title">分割视频</string>
+    <string name="split_button">分割</string>
+    <string name="split_time_hint">分割时间(秒)</string>
+
+    <string name="merge_video_title">合并视频</string>
+    <string name="select_second_video">选择第二个视频</string>
+    <string name="no_second_video_selected">未选择第二个视频</string>
+    <string name="merge_videos_button">合并视频</string>
+
+    <!-- 速度调节区域 -->
+    <string name="speed_adjustment">速度调节</string>
+    <string name="speed_factor_hint">速度倍数(如0.5或2.0)</string>
+    <string name="speed_up_2x">加速(2x)</string>
+    <string name="speed_down_05x">减速(0.5x)</string>
+
+    <!-- 处理进度区域 -->
+    <string name="processing_progress">处理进度</string>
+    <string name="waiting_for_operation">等待操作...</string>
+
+    <!-- 状态信息 -->
+    <string name="analyzing_video_info">正在分析视频信息...</string>
+    <string name="extracting_cover">正在提取封面...</string>
+    <string name="loading_cover">正在加载封面图片...</string>
+    <string name="cover_extraction_successful">封面提取成功！</string>
+    <string name="cover_extraction_failed">封面提取失败</string>
+    <string name="cover_load_successful">封面图片加载成功</string>
+    <string name="cover_load_failed">封面图片加载失败</string>
+
+    <!-- 错误提示 -->
+    <string name="please_select_video">请先选择视频</string>
+    <string name="invalid_video_file">视频文件无效</string>
+    <string name="invalid_time">请输入有效的时间数字</string>
+    <string name="invalid_speed_factor">请输入有效的速度倍数</string>
+    <string name="start_time_must_be_less">开始时间必须小于结束时间</string>
+    <string name="duration_too_short">时长不能小于1秒</string>
+    <string name="cannot_create_output_file">无法创建输出文件</string>
+    <string name="cannot_create_directory">无法创建目录</string>
+
+    <!-- 成功提示 -->
+    <string name="compression_completed">压缩完成</string>
+    <string name="crop_completed">裁剪完成</string>
+    <string name="split_completed">分割完成</string>
+    <string name="merge_completed">合并完成</string>
+    <string name="speed_adjustment_completed">速度调节完成</string>
+    <string name="saved_to_album">已保存到相册</string>
+    <string name="saved_to_app_directory">已保存在应用目录</string>
+
+    <!-- 进度描述 -->
+    <string name="starting_compression">开始压缩视频...</string>
+    <string name="initializing_transcoder">初始化转码器...</string>
+    <string name="starting_video_encoding">开始编码视频...</string>
+    <string name="processing_audio_track">处理音频轨道...</string>
+    <string name="saving_file">正在保存文件...</string>
+
+    <string name="starting_crop">开始裁剪视频...</string>
+    <string name="processing_video">处理视频...</string>
+    <string name="adjusting_crop_point">调整裁剪起始点...</string>
+
+    <string name="starting_split">开始分割视频...</string>
+    <string name="analyzing_video_features">分析视频编码特征...</string>
+    <string name="finding_best_split_point">查找最佳分割点...</string>
+
+    <string name="starting_merge">开始合并视频...</string>
+    <string name="analyzing_video_format">分析视频格式...</string>
+    <string name="creating_output_file">创建输出文件...</string>
+    <string name="processing_audio_and_video">正在合并音频和视频...</string>
+    <string name="audio_video_merge_completed">音视频合并完成</string>
+
+    <string name="frame_count">已处理 %1$d 帧</string>
+
+    <string name="video_frames">视频%1$d: 处理了%2$d帧</string>
+    <string name="audio_frames">音频%1$d: 处理了%2$d帧</string>
+
+    <!-- 文件信息格式 -->
+    <string name="file_size_format">大小: %1$s</string>
+    <string name="duration_format">时长: %1$s</string>
+    <string name="compression_ratio_format">压缩比: %1$s</string>
+    <string name="bitrate_format">码率: %1$s</string>
+
+    <!-- 进度弹窗相关 -->
+    <string name="processing">正在处理</string>
+    <string name="initializing">初始化中...</string>
+    <string name="operation_cancelled">操作已取消</string>
+    <string name="cancelling_operation">正在取消操作...</string>
+
+    <!-- 操作标题 -->
+    <string name="serial_compression_title">串行压缩视频</string>
+    <string name="parallel_compression_title">智能压缩视频</string>
+    <string name="extract_cover_title">提取封面</string>
+    <string name="crop_video_title_dialog">裁剪视频</string>
+    <string name="split_video_title_dialog">分割视频</string>
+    <string name="merge_video_title_dialog">合并视频</string>
+    <string name="speed_adjustment_title">速度调节</string>
+    <string name="set_cover_title">设置封面</string>
+</resources>
