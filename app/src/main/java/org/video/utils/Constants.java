@@ -84,7 +84,7 @@ public class Constants {
     public static final int MIN_SEGMENT_DURATION_SECONDS = 2; // 最小分片时长2秒
     public static final int MIN_SEGMENT_DURATION_US = 2000000; // 2秒对应的微秒数
     public static final int KEY_FRAMES_PER_SEGMENT = 5; // 每个分片对应5个关键帧位置
-    public static final int MAX_THREADS_FOR_LONG_VIDEO = 2; // 长视频最大线程数
+    public static final int MAX_THREADS_FOR_LONG_VIDEO = 4; // 长视频最大线程数
     public static final int MAX_THREADS_FOR_MEDIUM_VIDEO = 4; // 中等视频最大线程数
     public static final int MAX_THREADS_FOR_SHORT_VIDEO = 3; // 短视频最大线程数
 

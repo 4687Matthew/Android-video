@@ -1695,6 +1695,13 @@ public class VideoEditor {
             int availableCores = Runtime.getRuntime().availableProcessors();
             Log.d(TAG, "可用处理器核心数: " + availableCores);
 
+
+            Log.d(TAG, String.format("duration计算: duration=%d微秒(%.1f秒), 10分钟阈值=%d微秒, 比较结果=%s",
+                    duration,
+                    TimeUtils.microsecondsToSeconds(duration),
+                    TimeUtils.secondsToMicroseconds(10 * 60),
+                    duration > TimeUtils.secondsToMicroseconds(10 * 60) ? "大于" : "小于等于"));
+
             // 根据视频时长和核心数确定线程数
             int maxThreads;
             if (duration > TimeUtils.secondsToMicroseconds(10 * 60)) { // 超过10分钟
@@ -2741,6 +2748,13 @@ public class VideoEditor {
      * 获取采样间隔
      */
     private static long getSampleInterval(long duration, int maxThreads) {
+
+        Log.d(TAG, String.format("maxThreads计算: 分支=%s, MAX_THREADS_FOR_LONG_VIDEO=%d, 结果=%d",
+                (duration > TimeUtils.secondsToMicroseconds(10 * 60)) ? "长视频" :
+                        (duration > TimeUtils.secondsToMicroseconds(5 * 60)) ? "中视频" : "短视频",
+                Constants.MAX_THREADS_FOR_LONG_VIDEO,
+                maxThreads));
+
         long sampleInterval;
         if (duration > TimeUtils.secondsToMicroseconds(30 * 60)) { // 超过30分钟
             sampleInterval = TimeUtils.secondsToMicroseconds(20); // 20秒
